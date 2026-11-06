@@ -49,7 +49,22 @@ class Units {
   static constexpr Real rad_constant_cgs = 7.56573325e-15;        // erg/(cm^3*K^4)
   static constexpr Real electron_rest_mass_energy_cgs = 5.93e9;   // k
 
-  // Power Law Coefficients (cgs)
+  // Kramers power-law opacity coefficients (cgs): kappa = coef * rho * T^-3.5.
+  // These replaced the pure free-free Rosseland value 8.0e22 (Rybicki & Lightman)
+  // in upstream commit 811c2de4, and carry the magnitude of a Kramers BOUND-FREE +
+  // FREE-FREE Rosseland mean at roughly solar composition
+  // (4.34e25 Z(1+X)/t + 3.68e22 (1-Z)(1+X) with X ~ 0.7, Z ~ 0.02-0.025, guillotine
+  // t ~ 1), NOT pure free-free (which is 6e22 Rosseland / 2.2e24 Planck for a
+  // solar H/He mix).  The Planck coefficient is 37x the Rosseland one; the bare
+  // nu^-3 (1 - e^{-h nu/kT}) law gives 30.26 (radiation/opacity_ff_means.hpp computes
+  // it), so the pair carries a Planck/Rosseland Gaunt-factor ratio of ~1.22 from its
+  // source; for bound-free the same law is an approximation (edges lower the Planck
+  // mean).  For an AGN disk at T ~ 1e5-1e7 K, where bound-free
+  // dominates absorption, this is the physically intended choice; pure free-free
+  // would be ~25x too transparent.  The ratio is what sets the Rosseland-mean flux
+  // damping.  KORAL's default
+  // free-free kappa (6.6e-24/m_p^2 ~ 2.4e24, opacities.c) is a PLANCK mean and is
+  // not comparable to the Rosseland value here.
   static constexpr Real rosseland_coef_cgs = 1.95705e24;
   static constexpr Real planck_minus_rosseland_coef_cgs = 7.04536e25;
 
@@ -67,6 +82,12 @@ class Units {
   Real density_cgs() const;
   Real energy_cgs() const;
   Real pressure_cgs() const;
+  //! The IDEAL-GAS temperature unit, v_cgs^2*mu*m_u/k_B with the deck's <units>/mu.
+  //! It is NOT necessarily the unit of the number the run calls temperature: the code
+  //! temperature unit is the EOS's, and Units::temperature_cgs() equals it only for
+  //! the ideal EOS (a tabulated EOS builds its own scale).
+  //! Consumers must use MeshBlockPack::TemperatureUnitCGS() instead; this stays public
+  //! because kelvin(), k_boltzmann() and the EOS itself define that ideal-gas unit.
   Real temperature_cgs() const;
 
   // Code unit per X, or X in code units

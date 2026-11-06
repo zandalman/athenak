@@ -33,6 +33,7 @@
 #include <algorithm>    // max()
 
 #include "athena.hpp"
+#include "reconstruct/thermal_floors.hpp"
 
 //----------------------------------------------------------------------------------------
 //! \fn PPM4()
@@ -179,6 +180,168 @@ void PPMX(const Real &q_im2, const Real &q_im1, const Real &q_i, const Real &q_i
   //---- set L/R states ----
   ql_ip1 = qrv;
   qr_i   = qlv;
+  return;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn PiecewiseParabolicX1()
+//! \brief Wrapper function for PPM reconstruction in x1-direction.
+//! This function should be called over [is-1,ie+1] to get BOTH L/R states over [is,ie]
+
+KOKKOS_INLINE_FUNCTION
+void PiecewiseParabolicX1(TeamMember_t const &member,
+     const EOS_Data &eos, const bool extremum_preserving, const bool apply_floors,
+     const int m, const int k, const int j, const int il, const int iu,
+     const DvceArray5D<Real> &q, ScrArray2D<Real> &ql, ScrArray2D<Real> &qr) {
+  int nvar = q.extent_int(1);
+  const Real &dfloor_ = eos.dfloor;
+  for (int n=0; n<nvar; ++n) {
+    if (extremum_preserving) {
+      par_for_inner(member, il, iu, [&](const int i) {
+        Real &qim2 = q(m,n,k,j,i-2);
+        Real &qim1 = q(m,n,k,j,i-1);
+        Real &qi   = q(m,n,k,j,i  );
+        Real &qip1 = q(m,n,k,j,i+1);
+        Real &qip2 = q(m,n,k,j,i+2);
+        PPMX(qim2, qim1, qi, qip1, qip2, ql(n,i+1), qr(n,i));
+        if (apply_floors) {
+          if (n==IDN) {
+            ql(IDN,i+1) = fmax(ql(IDN,i+1), dfloor_);
+            qr(IDN,i  ) = fmax(qr(IDN,i  ), dfloor_);
+          } else if (n==IEN && eos.use_e) {
+            FloorReconstructedInternalEnergyPair(eos, ql(IEN,i+1), qr(IEN,i),
+                                                 ql(IDN,i+1), qr(IDN,i));
+          }
+        }
+      });
+    } else {
+      par_for_inner(member, il, iu, [&](const int i) {
+        Real &qim2 = q(m,n,k,j,i-2);
+        Real &qim1 = q(m,n,k,j,i-1);
+        Real &qi   = q(m,n,k,j,i  );
+        Real &qip1 = q(m,n,k,j,i+1);
+        Real &qip2 = q(m,n,k,j,i+2);
+        PPM4(qim2, qim1, qi, qip1, qip2, ql(n,i+1), qr(n,i));
+        if (apply_floors) {
+          if (n==IDN) {
+            ql(IDN,i+1) = fmax(ql(IDN,i+1), dfloor_);
+            qr(IDN,i  ) = fmax(qr(IDN,i  ), dfloor_);
+          } else if (n==IEN && eos.use_e) {
+            FloorReconstructedInternalEnergyPair(eos, ql(IEN,i+1), qr(IEN,i),
+                                                 ql(IDN,i+1), qr(IDN,i));
+          }
+        }
+      });
+    }
+  }
+  return;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn PiecewiseParabolicX2()
+//! \brief Wrapper function for PPM reconstruction in x2-direction.
+//! This function should be called over [js-1,je+1] to get BOTH L/R states over [js,je]
+
+KOKKOS_INLINE_FUNCTION
+void PiecewiseParabolicX2(TeamMember_t const &member,
+     const EOS_Data &eos, const bool extremum_preserving, const bool apply_floors,
+     const int m, const int k, const int j, const int il, const int iu,
+     const DvceArray5D<Real> &q, ScrArray2D<Real> &ql_jp1, ScrArray2D<Real> &qr_j) {
+  int nvar = q.extent_int(1);
+  const Real &dfloor_ = eos.dfloor;
+  for (int n=0; n<nvar; ++n) {
+    if (extremum_preserving) {
+      par_for_inner(member, il, iu, [&](const int i) {
+        Real &qjm2 = q(m,n,k,j-2,i);
+        Real &qjm1 = q(m,n,k,j-1,i);
+        Real &qj   = q(m,n,k,j  ,i);
+        Real &qjp1 = q(m,n,k,j+1,i);
+        Real &qjp2 = q(m,n,k,j+2,i);
+        PPMX(qjm2, qjm1, qj, qjp1, qjp2, ql_jp1(n,i), qr_j(n,i));
+        if (apply_floors) {
+          if (n==IDN) {
+            ql_jp1(IDN,i) = fmax(ql_jp1(IDN,i), dfloor_);
+            qr_j  (IDN,i) = fmax(qr_j  (IDN,i), dfloor_);
+          } else if (n==IEN && eos.use_e) {
+            FloorReconstructedInternalEnergyPair(eos, ql_jp1(IEN,i), qr_j(IEN,i),
+                                                 ql_jp1(IDN,i), qr_j(IDN,i));
+          }
+        }
+      });
+    } else {
+      par_for_inner(member, il, iu, [&](const int i) {
+        Real &qjm2 = q(m,n,k,j-2,i);
+        Real &qjm1 = q(m,n,k,j-1,i);
+        Real &qj   = q(m,n,k,j  ,i);
+        Real &qjp1 = q(m,n,k,j+1,i);
+        Real &qjp2 = q(m,n,k,j+2,i);
+        PPM4(qjm2, qjm1, qj, qjp1, qjp2, ql_jp1(n,i), qr_j(n,i));
+        if (apply_floors) {
+          if (n==IDN) {
+            ql_jp1(IDN,i) = fmax(ql_jp1(IDN,i), dfloor_);
+            qr_j  (IDN,i) = fmax(qr_j  (IDN,i), dfloor_);
+          } else if (n==IEN && eos.use_e) {
+            FloorReconstructedInternalEnergyPair(eos, ql_jp1(IEN,i), qr_j(IEN,i),
+                                                 ql_jp1(IDN,i), qr_j(IDN,i));
+          }
+        }
+      });
+    }
+  }
+  return;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn PiecewiseParabolicX3()
+//! \brief Wrapper function for PPM reconstruction in x3-direction.
+//! This function should be called over [ks-1,ke+1] to get BOTH L/R states over [ks,ke]
+
+KOKKOS_INLINE_FUNCTION
+void PiecewiseParabolicX3(TeamMember_t const &member,
+     const EOS_Data &eos, const bool extremum_preserving, const bool apply_floors,
+     const int m, const int k, const int j, const int il, const int iu,
+     const DvceArray5D<Real> &q, ScrArray2D<Real> &ql_kp1, ScrArray2D<Real> &qr_k) {
+  int nvar = q.extent_int(1);
+  const Real &dfloor_ = eos.dfloor;
+  for (int n=0; n<nvar; ++n) {
+    if (extremum_preserving) {
+      par_for_inner(member, il, iu, [&](const int i) {
+        Real &qkm2 = q(m,n,k-2,j,i);
+        Real &qkm1 = q(m,n,k-1,j,i);
+        Real &qk   = q(m,n,k  ,j,i);
+        Real &qkp1 = q(m,n,k+1,j,i);
+        Real &qkp2 = q(m,n,k+2,j,i);
+        PPMX(qkm2, qkm1, qk, qkp1, qkp2, ql_kp1(n,i), qr_k(n,i));
+        if (apply_floors) {
+          if (n==IDN) {
+            ql_kp1(IDN,i) = fmax(ql_kp1(IDN,i), dfloor_);
+            qr_k  (IDN,i) = fmax(qr_k  (IDN,i), dfloor_);
+          } else if (n==IEN && eos.use_e) {
+            FloorReconstructedInternalEnergyPair(eos, ql_kp1(IEN,i), qr_k(IEN,i),
+                                                 ql_kp1(IDN,i), qr_k(IDN,i));
+          }
+        }
+      });
+    } else {
+      par_for_inner(member, il, iu, [&](const int i) {
+        Real &qkm2 = q(m,n,k-2,j,i);
+        Real &qkm1 = q(m,n,k-1,j,i);
+        Real &qk   = q(m,n,k  ,j,i);
+        Real &qkp1 = q(m,n,k+1,j,i);
+        Real &qkp2 = q(m,n,k+2,j,i);
+        PPM4(qkm2, qkm1, qk, qkp1, qkp2, ql_kp1(n,i), qr_k(n,i));
+        if (apply_floors) {
+          if (n==IDN) {
+            ql_kp1(IDN,i) = fmax(ql_kp1(IDN,i), dfloor_);
+            qr_k  (IDN,i) = fmax(qr_k  (IDN,i), dfloor_);
+          } else if (n==IEN && eos.use_e) {
+            FloorReconstructedInternalEnergyPair(eos, ql_kp1(IEN,i), qr_k(IEN,i),
+                                                 ql_kp1(IDN,i), qr_k(IDN,i));
+          }
+        }
+      });
+    }
+  }
   return;
 }
 #endif // RECONSTRUCT_PPM_HPP_

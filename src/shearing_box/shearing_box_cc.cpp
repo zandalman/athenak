@@ -99,7 +99,6 @@ TaskStatus ShearingBoxCC::PackAndSendCC(DvceArray5D<Real> &a, ReconstructionMeth
           break;
         case ReconstructionMethod::ppm4:
         case ReconstructionMethod::ppmx:
-        case ReconstructionMethod::teno:
         case ReconstructionMethod::wenoz:
           PPMX_RemapFlx(member, js, (je+1), eps, a_, flx);
           break;
@@ -123,7 +122,7 @@ TaskStatus ShearingBoxCC::PackAndSendCC(DvceArray5D<Real> &a, ReconstructionMeth
   //  * Case2 is when the sending MB straddles the boundary between MBs, and so requires
   //    copy/send to only two target MBs.
   // Use deep copy if target MB on same rank, or MPI sends if not
-  Kokkos::fence();
+  DevExeSpace().fence();
   const int &nx2 = indcs.nx2;
   bool no_errors=true;
   for (int n=0; n<2; ++n) {

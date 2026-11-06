@@ -1,0 +1,92 @@
+<comment>
+problem = Jeans wave, hydro + self-gravity, static SMR with LAT bins
+
+<job>
+basename = JeansHydroLAT
+
+<mesh>
+nghost = 4
+nx1    = 32
+x1min  = 0.0
+x1max  = 1.0
+ix1_bc = periodic
+ox1_bc = periodic
+
+nx2    = 16
+x2min  = 0.0
+x2max  = 0.5
+ix2_bc = periodic
+ox2_bc = periodic
+
+nx3    = 16
+x3min  = 0.0
+x3max  = 0.5
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 8
+nx2 = 8
+nx3 = 8
+
+<mesh_refinement>
+refinement       = static
+max_nmb_per_rank = 512
+
+<refined_region1>
+level = 1
+x1min = 0.25
+x1max = 0.75
+x2min = 0.0
+x2max = 0.5
+x3min = 0.0
+x3max = 0.5
+
+<time>
+evolution  = dynamic
+integrator = rk2
+cfl_number = 0.2
+nlim       = -1
+tlim       = 0.4
+ndiag      = 100000
+lat        = true
+lat_levels = 2
+hydro_lat_min_bin_count = 0
+
+<hydro>
+eos             = isothermal
+reconstruct     = plm
+rsolver         = hlle
+iso_sound_speed = 1.0
+
+<gravity>
+four_pi_G      = 1.0
+threshold      = -1
+niteration     = 5
+npresmooth     = 2
+npostsmooth    = 2
+full_multigrid = true
+fmg_ncycle     = 1
+show_defect    = 0
+mg_nghost      = 1
+solve_dt       = 0.007
+
+<hydro_srcterms>
+self_gravity = true
+
+<problem>
+pgen_name = gravity
+rho0      = 1.0
+amp       = 1.0e-6
+n_waves   = 1
+n_jeans   = 2.0
+v0        = 0.0
+
+<output1>
+file_type = bin
+variable  = hydro_w
+dt        = 0.4
+
+<output2>
+file_type = rst
+dt        = 0.2

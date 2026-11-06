@@ -49,7 +49,24 @@ void Radiation::AssembleRadTasks(std::map<std::string, std::shared_ptr<TaskList>
     id.rad_rkupdt= tl["stagen"]->AddTask(&Radiation::RKUpdate, this, id.rad_recvf);
     id.rad_src   = tl["stagen"]->AddTask(&Radiation::RadSrcTerms, this, id.rad_rkupdt);
     id.mhd_flux  = tl["stagen"]->AddTask(&mhd::MHD::Fluxes, pmhd, id.rad_src);
-    id.mhd_sendf = tl["stagen"]->AddTask(&mhd::MHD::SendFlux, pmhd, id.mhd_flux);
+    // MHD::InitRecv posts the FOFC order-mask receive whenever <mhd>/fofc is on, on every
+    // mesh, and MHD::ClearRecv waits on it; MHD::Fluxes then only tests the owned cells.
+    // So this graph has to run the matching exchange and replacement of mhd_tasks.cpp
+    // (the ordinary, non-LAT branch: time/lat is refused with <radiation>).  Each task
+    // returns at once when the exchange is not configured.
+    TaskID mhd_final_flux = id.mhd_flux;
+    if (pmhd->use_fofc) {
+      id.mhd_prep_fofc = tl["stagen"]->AddTask(
+          &mhd::MHD::PrepareFOFCFlags, pmhd, id.mhd_flux);
+      id.mhd_send_fofc = tl["stagen"]->AddTask(
+          &mhd::MHD::SendFOFCFlags, pmhd, id.mhd_prep_fofc);
+      id.mhd_recv_fofc = tl["stagen"]->AddTask(
+          &mhd::MHD::RecvFOFCFlags, pmhd, id.mhd_send_fofc);
+      id.mhd_repl_fofc = tl["stagen"]->AddTask(
+          &mhd::MHD::ReplaceCanonicalFOFC, pmhd, id.mhd_recv_fofc);
+      mhd_final_flux = id.mhd_repl_fofc;
+    }
+    id.mhd_sendf = tl["stagen"]->AddTask(&mhd::MHD::SendFlux, pmhd, mhd_final_flux);
     id.mhd_recvf = tl["stagen"]->AddTask(&mhd::MHD::RecvFlux, pmhd, id.mhd_sendf);
     id.mhd_rkupdt= tl["stagen"]->AddTask(&mhd::MHD::RKUpdate, pmhd, id.mhd_recvf);
     id.mhd_src   = tl["stagen"]->AddTask(&mhd::MHD::MHDSrcTerms, pmhd, id.mhd_rkupdt);
@@ -94,7 +111,17 @@ void Radiation::AssembleRadTasks(std::map<std::string, std::shared_ptr<TaskList>
     id.rad_rkupdt= tl["stagen"]->AddTask(&Radiation::RKUpdate, this, id.rad_recvf);
     id.rad_src   = tl["stagen"]->AddTask(&Radiation::RadSrcTerms, this, id.rad_rkupdt);
     id.hyd_flux  = tl["stagen"]->AddTask(&hydro::Hydro::Fluxes, phyd, id.rad_src);
-    id.hyd_sendf = tl["stagen"]->AddTask(&hydro::Hydro::SendFlux, phyd, id.hyd_flux);
+    // As for MHD above: with fofc, Hydro::Fluxes only tests the owned cells, and the
+    // owners' flags of the first ghost layer and the replacement follow here.
+    TaskID hyd_final_flux = id.hyd_flux;
+    if (phyd->use_fofc) {
+      TaskID prep = tl["stagen"]->AddTask(&hydro::Hydro::PrepareFOFCFlags, phyd,
+                                          id.hyd_flux);
+      TaskID send = tl["stagen"]->AddTask(&hydro::Hydro::SendFOFCFlags, phyd, prep);
+      TaskID recv = tl["stagen"]->AddTask(&hydro::Hydro::RecvFOFCFlags, phyd, send);
+      hyd_final_flux = tl["stagen"]->AddTask(&hydro::Hydro::ReplaceFOFC, phyd, recv);
+    }
+    id.hyd_sendf = tl["stagen"]->AddTask(&hydro::Hydro::SendFlux, phyd, hyd_final_flux);
     id.hyd_recvf = tl["stagen"]->AddTask(&hydro::Hydro::RecvFlux, phyd, id.hyd_sendf);
     id.hyd_rkupdt= tl["stagen"]->AddTask(&hydro::Hydro::RKUpdate,phyd,id.hyd_recvf);
     id.hyd_src   = tl["stagen"]->AddTask(&hydro::Hydro::HydroSrcTerms,phyd,id.hyd_rkupdt);
@@ -189,7 +216,7 @@ TaskStatus Radiation::CopyCons(Driver *pdrive, int stage) {
       Kokkos::deep_copy(DevExeSpace(), pmhd->b1.x2f, pmhd->b0.x2f);
       Kokkos::deep_copy(DevExeSpace(), pmhd->b1.x3f, pmhd->b0.x3f);
     } else if (phyd != nullptr) {
-      Kokkos::deep_copy(DevExeSpace(), phyd->u1, phyd->u0);
+      DeepCopyToBand(phyd->u1, phyd->u0);
     }
   }
   return TaskStatus::complete;
@@ -292,14 +319,9 @@ TaskStatus Radiation::ApplyPhysicalBCs(Driver *pdrive, int stage) {
     phyd->pbval_u->HydroBCs((pmy_pack), (phyd->pbval_u->u_in), phyd->u0);
   }
 
-  // TODO(@mhguo): this is temporary, need to move to a general mask function later
-  if (pmy_pack->pmesh->pzoom != nullptr) {
-    pmy_pack->pmesh->pzoom->ApplyMask();
-  }
-
   // user BCs
   if (pmy_pack->pmesh->pgen->user_bcs) {
-    (pmy_pack->pmesh->pgen->user_bcs_func)(pmy_pack->pmesh);
+    pmy_pack->pmesh->pgen->CallUserBoundaryFunction(pmy_pack->pmesh);
   }
 
   return TaskStatus::complete;
@@ -314,14 +336,12 @@ TaskStatus Radiation::Prolongate(Driver *pdrive, int stage) {
   if (pmy_pack->pmesh->multilevel) {  // only prolongate with SMR/AMR
     // prolongate specific intensity
     pbval_i->FillCoarseInBndryCC(i0, coarse_i0);
-
-    // Step 1: apply physical BCs to the coarse array, so the prolongation stencil
-    //         reads valid data in coarse ghost zones that sit at a physical boundary.
     if (!(pmy_pack->pmesh->strictly_periodic)) {
       pbval_i->RadiationBCsCoarse(pmy_pack, pbval_i->i_in, coarse_i0);
+      if (pmy_pack->pmesh->pgen->user_bcs) {
+        pbval_i->FillCoarseUserBndryCC(i0, coarse_i0);
+      }
     }
-
-    // Step 2: prolongate fine ghost zones from the coarse array.
     pbval_i->ProlongateCC(i0, coarse_i0);
   }
   return TaskStatus::complete;

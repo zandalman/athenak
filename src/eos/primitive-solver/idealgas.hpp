@@ -18,7 +18,7 @@
 
 namespace Primitive {
 
-class IdealGas : public EOSPolicyInterface {
+class IdealGas : public EOSPolicyInterface, public SupportsGasEntropy {
  protected:
   /// Adiabatic index
   Real gamma;
@@ -76,6 +76,19 @@ class IdealGas : public EOSPolicyInterface {
   /// Get the minimum enthalpy per baryon according to the ideal gas law.
   KOKKOS_INLINE_FUNCTION Real MinimumEnthalpy() const {
     return mb;
+  }
+
+  /// KORAL's specific gas entropy s = ln(p/rho^Gamma)/(Gamma-1), rho = n mb: S/rho of
+  /// koral_lite physics.c:1457-1475 (calc_Sfromu), in log form so that no power of rho
+  /// over- or underflows before the logarithm.  p = n T.
+  KOKKOS_INLINE_FUNCTION Real GasEntropy(Real n, Real T, Real *Y) const {
+    return (log(n*T) - gamma*log(n*mb))/gammam1;
+  }
+
+  /// Its inverse at fixed n: p = exp((Gamma-1) s) rho^Gamma (koral_lite physics.c:
+  /// 1494-1514, calc_ufromS, with u = p/(Gamma-1)), T = p/n.
+  KOKKOS_INLINE_FUNCTION Real TemperatureFromGasEntropy(Real n, Real s, Real *Y) const {
+    return exp(gammam1*s + gamma*log(n*mb))/n;
   }
 
   /// Calculate the sound speed for an ideal gas.

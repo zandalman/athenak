@@ -1,0 +1,72 @@
+<comment>
+problem = remap battery: MHD remap target (remap_test remap mode, <remap> block).
+Source path, mesh extents/resolution, band, and nlim are overridden per battery case.
+
+<job>
+basename = RTRemap
+
+<mesh>
+nghost = 2
+nx1 = 64
+x1min = -1.0
+x1max = 1.0
+ix1_bc = outflow
+ox1_bc = outflow
+
+nx2 = 64
+x2min = -1.0
+x2max = 1.0
+ix2_bc = outflow
+ox2_bc = outflow
+
+nx3 = 64
+x3min = -1.0
+x3max = 1.0
+ix3_bc = outflow
+ox3_bc = outflow
+
+<meshblock>
+nx1 = 16
+nx2 = 16
+nx3 = 16
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.3
+nlim = 0
+tlim = 10.0
+ndiag = 1
+
+<mhd>
+eos = ideal
+gamma = 1.6666666666666667
+reconstruct = plm
+rsolver = hlld
+dfloor = 1.0e-8
+pfloor = 1.0e-10
+
+<remap>
+enable = true
+source = replace_me.rst
+transition_band = false
+b_coarsen_ok = false
+b_taper_root_cells = 4
+b_report = true
+
+<problem>
+pgen_name = remap_test
+
+<output1>
+file_type = bin
+variable = mhd_divb
+dt = 0.001
+
+<output2>
+file_type = bin
+variable = mhd_u_bcc
+dt = 0.001
+
+<output3>
+file_type = rst
+dt = 100.0

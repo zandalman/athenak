@@ -103,3 +103,46 @@ def test_jeans_solve_iterative_cpu():
         )
     finally:
         cleanup()
+
+
+# A periodic source is almost all constant, and the mean that makes it solvable is
+# removed by a sum whose rounding left a constant of ~1e-12 behind; that constant sits in
+# the nullspace of the operator, so the defect floored there (4e-12 rms at 64^3 on one
+# rank) and a tolerance of 1e-12 was never met.  A second averaging pass on the residual
+# removes it.  This deck floored at 5e-12 before the fix (one rank).
+def test_jeans_solve_iterative_tight_cpu():
+    """SolveIterative should reach threshold=1e-12 on a periodic mesh (no nullspace floor)."""
+    try:
+        results = run_athenak(
+            "inputs/jeans_wave.athinput",
+            [
+                "mesh/nx1=64", "mesh/nx2=64", "mesh/nx3=64",
+                "mesh/x1min=-1.0", "mesh/x1max=1.0",
+                "mesh/x2min=-1.0", "mesh/x2max=1.0",
+                "mesh/x3min=-1.0", "mesh/x3max=1.0",
+                "meshblock/nx1=32", "meshblock/nx2=32", "meshblock/nx3=32",
+                "mesh_refinement/refinement=none",
+                "time/nlim=1",
+                "time/tlim=1.0",
+                "time/cfl_number=0.3",
+                "problem/amp=1.0e-3",
+                "problem/n_jeans=0.8",
+                "gravity/threshold=1.0e-12",
+                "gravity/niteration=40",
+                "gravity/npresmooth=2",
+                "gravity/npostsmooth=2",
+                "gravity/full_multigrid=true",
+                "gravity/fmg_ncycle=1",
+                "gravity/show_defect=2",
+            ],
+        )
+        assert results[0], "SolveIterative tight Jeans CPU run failed"
+        assert_solver_convergence(
+            results[1],
+            threshold=1.0e-12,
+            max_iterations=12,
+            max_avg_ratio=0.3,
+            label="jeans_solve_iterative_tight_cpu: ",
+        )
+    finally:
+        cleanup()

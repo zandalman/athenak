@@ -23,7 +23,7 @@
 #include "mhd/mhd.hpp"
 #include "dyn_grmhd/dyn_grmhd.hpp"
 #include "coordinates/adm.hpp"
-#include "pgen/pgen.hpp"
+#include "pgen.hpp"
 
 #include <Kokkos_Random.hpp>
 
@@ -57,6 +57,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   int &js = indcs.js; int &je = indcs.je;
   int &ks = indcs.ks; int &ke = indcs.ke;
   MeshBlockPack *pmbp = pmy_mesh_->pmb_pack;
+  if (pmbp->pmhd != nullptr) pmbp->pmhd->RequireField("The kh problem generator");
   auto &size = pmbp->pmb->mb_size;
 
   // Select either Hydro or MHD
@@ -154,6 +155,8 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       pres = 1.0;
       vx = rval;
       vy = vshear*sin(2.*M_PI*x1v);
+      vz = 0.0;
+      scal = 0.0;
     // Lecoanet test ICs
     } else if (iprob == 4) {
       pres = 10.0;

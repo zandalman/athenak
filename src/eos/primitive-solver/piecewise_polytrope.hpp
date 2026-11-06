@@ -31,7 +31,7 @@ namespace Primitive {
 
 #define MAX_PIECES 7
 
-class PiecewisePolytrope : public EOSPolicyInterface {
+class PiecewisePolytrope : public EOSPolicyInterface, public SupportsGasEntropy {
  protected:
   /// Number of polytropes in the EOS
   int n_pieces;
@@ -124,6 +124,19 @@ class PiecewisePolytrope : public EOSPolicyInterface {
     return eps_cold + T/(mb*(gamma_thermal - 1.0));
   }
 
+  /// The thermal adiabat ln(p_th/rho^gamma_thermal)/(gamma_thermal - 1), p_th = n T,
+  /// rho = n mb.  The polytropic pieces are a cold barotrope with eps_cold continuous
+  /// across the pieces, adiabatic by itself, so the first law at zero heat leaves
+  /// d e_th = (e_th + p_th) dn/n: p_th scales as n^gamma_thermal along an adiabat.
+  KOKKOS_INLINE_FUNCTION Real GasEntropy(Real n, Real T, Real *Y) const {
+    return (log(n*T) - gamma_thermal*log(n*mb))/(gamma_thermal - 1.0);
+  }
+
+  /// Its inverse at fixed n: p_th = exp((gamma_thermal - 1) s) rho^gamma_thermal.
+  KOKKOS_INLINE_FUNCTION Real TemperatureFromGasEntropy(Real n, Real s, Real *Y) const {
+    return exp((gamma_thermal - 1.0)*s + gamma_thermal*log(n*mb))/n;
+  }
+
   /// Calculate the minimum pressure at a given density and composition
   KOKKOS_INLINE_FUNCTION Real MinimumPressure(Real n, Real *Y) const {
     int p = FindPiece(n);
@@ -205,8 +218,6 @@ class PiecewisePolytrope : public EOSPolicyInterface {
     density_pieces[0] = densities[1]/mb;
     gamma_pieces[0] = gammas[0];
     pressure_pieces[0] = P0;
-    eps_pieces[0] = 0.0;
-
 
     for (int i = 1; i < n; i++) {
       density_pieces[i] = densities[i]/mb;

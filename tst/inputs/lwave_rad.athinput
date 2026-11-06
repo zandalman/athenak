@@ -55,6 +55,7 @@ tlim       = 1.0      # time limit
 <hydro>
 eos         = ideal  # EOS type
 reconstruct = wenoz  # spatial reconstruction method
+fofc        = true
 rsolver     = hlle   # Riemann-solver to be used
 gamma = 1.6666666666666667  # gamma = C_p/C_v
 

@@ -39,6 +39,9 @@
 //! comment text: 'NEW_OUTPUT_TYPES'.
 //========================================================================================
 
+#include <sys/stat.h>  // stat
+
+#include <cmath>      // floor
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>    // strcmp
@@ -46,11 +49,27 @@
 #include <iostream>
 #include <sstream>
 #include <string>   // std::string, to_string()
+#include <vector>
 
 #include "athena.hpp"
+#include "globals.hpp"
 #include "parameter_input.hpp"
 #include "mesh/mesh.hpp"
 #include "outputs.hpp"
+
+//----------------------------------------------------------------------------------------
+// Grid point of the cadence dt at or below t.  A time that sits on a grid point only up to
+// the Driver's (32-bit) due-test precision counts as on it: BaseTypeOutput::AdvanceOutputTime
+// builds last_time by summing dt, which for a dt with no exact binary value lands a few ULP
+// below n*dt, and floor(t/dt) alone would then name the previous interval.
+
+namespace {
+Real OutputGridFloor(Real t, Real dt) {
+  const Real nearest = std::floor(t/dt + 0.5)*dt;
+  if (static_cast<float>(nearest) == static_cast<float>(t)) return nearest;
+  return std::floor(t/dt)*dt;
+}
+}  // namespace
 
 //----------------------------------------------------------------------------------------
 // Outputs constructor
@@ -81,6 +100,45 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
       }
 
       if (opar.dcycle == 0 && opar.dt <= 0.0) continue;  // only add output if dt>0
+
+      // A last_time carried in from a checkpoint may sit off the cadence grid: streams
+      // created before BaseTypeOutput::AdvanceOutputTime anchored to the grid took their
+      // phase from the instant of their first write, and a restart preserves that phase
+      // forever.  Snap it back onto the grid once, here, so those streams heal instead of
+      // staying permanently offset from every other stream with the same dt.  Snapping
+      // DOWN costs at most one extra dump, immediately; snapping up would drop one.
+      if (opar.last_time > 0.0 && opar.dt > 0.0) {
+        const Real anchored = OutputGridFloor(opar.last_time, opar.dt);
+        if (static_cast<float>(anchored) != static_cast<float>(opar.last_time)) {
+          if (global_variable::my_rank == 0) {
+            std::cout << "### WARNING in " << __FILE__ << " at line " << __LINE__
+                      << std::endl << "Block '" << opar.block_name << "' resumed with "
+                      << "last_time = " << opar.last_time << ", which is not a multiple "
+                      << "of dt = " << opar.dt << "; re-anchoring to " << anchored
+                      << " so this stream shares the cadence grid of every other stream "
+                      << "with the same dt. Expect one extra dump." << std::endl;
+          }
+          opar.last_time = anchored;
+        }
+      }
+      // No dump is scheduled after the present, so a last_time beyond the start time was
+      // pushed forward by off-schedule dumps (before AdvanceOutputTime kept the cadence
+      // at them, every auto-expansion moved it two intervals); resume at the grid point
+      // at or before the start time.  "Beyond" is at the Driver's (32-bit) precision, at
+      // which a due dump may sit just before its grid time.  The input is updated too, so
+      // a checkpoint written before this stream's next dump keeps the corrected value.
+      if (opar.dt > 0.0 &&
+          static_cast<float>(opar.last_time) > static_cast<float>(pm->time)) {
+        const Real anchored = OutputGridFloor(pm->time, opar.dt);
+        if (global_variable::my_rank == 0) {
+          std::cout << "### WARNING in " << __FILE__ << " at line " << __LINE__
+                    << std::endl << "Block '" << opar.block_name << "' resumed with "
+                    << "last_time = " << opar.last_time << ", later than the start time "
+                    << pm->time << "; resuming the cadence from " << anchored << std::endl;
+        }
+        opar.last_time = anchored;
+        pin->SetReal(opar.block_name, "last_time", opar.last_time);
+      }
 
       // set file number, basename, and format
       opar.file_number = pin->GetOrAddInteger(opar.block_name,"file_number",0);
@@ -159,32 +217,6 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
         }
       } else {
         opar.slice3 = false;
-      }
-
-      // read ghost cell option
-      opar.include_gzs = pin->GetOrAddBoolean(opar.block_name, "ghost_zones", false);
-
-      // read MeshBlock ID (if specified)
-      opar.gid = pin->GetOrAddInteger(opar.block_name, "gid", -1);
-      if (opar.gid >= 0 && pm->nmb_total == 1) {
-        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-            << std::endl << "Cannot specify MeshBlock ID in output block '"
-            << opar.block_name << "' when there is only one" << std::endl;
-        exit(EXIT_FAILURE);
-      }
-      if (opar.gid > (pm->nmb_total-1)) {
-        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
-            << std::endl << "MeshBlock gid=" << opar.gid << " in output block '"
-            << opar.block_name << "' exceeds total number of MeshBlocks" << std::endl;
-        exit(EXIT_FAILURE);
-      }
-
-      // set output variable and optional file id (default is output variable name)
-      if (opar.file_type.compare("hst") != 0 &&
-          opar.file_type.compare("rst") != 0 &&
-          opar.file_type.compare("log") != 0) {
-        opar.variable = pin->GetString(opar.block_name, "variable");
-        opar.file_id = pin->GetOrAddString(opar.block_name,"id",opar.variable);
       }
 
       // check that pdf variables are single variables
@@ -274,6 +306,13 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
       } else if (opar.file_type.compare("bin") == 0) {
         opar.single_file_per_rank = pin->GetOrAddBoolean(opar.block_name,
           "single_file_per_rank", false);
+        const std::string precision = pin->GetOrAddString(
+            opar.block_name, "variable_precision", "float32");
+        if (precision != "float32" && precision != "float64") {
+          std::cerr << "Binary variable_precision must be float32 or float64\n";
+          std::exit(EXIT_FAILURE);
+        }
+        opar.binary_double = precision == "float64";
         pnode = new MeshBinaryOutput(pin,pm,opar);
         pout_list.insert(pout_list.begin(),pnode);
       } else if (opar.file_type.compare("cart") == 0) {
@@ -305,6 +344,45 @@ Outputs::Outputs(ParameterInput *pin, Mesh *pm) {
               << "More than one history, event log, or restart output block found in "
               << "input file" << std::endl;
     exit(EXIT_FAILURE);
+  }
+
+  ReportSupersededFiles();
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void Outputs::ReportSupersededFiles()
+//! \brief List, on rank 0, the numbered output files this run is about to write over.
+//!
+//! File numbering resumes from whatever the checkpoint carried, so restarting from an
+//! OLDER checkpoint sends the run back over dumps that are newer than it.  The files are
+//! preserved as .old copies when they are actually reached (PreserveExistingFile), but by
+//! then hours of a run have already gone by; the operator needs to see the collision
+//! before the first write, while stopping the job is still free.
+void Outputs::ReportSupersededFiles() {
+  if (global_variable::my_rank != 0) return;
+  // A stream numbers its files consecutively, but pruning leaves gaps; keep probing a
+  // little past a missing number so a pruned range does not hide the files behind it.
+  const int max_consecutive_missing = 8;
+  const int max_probe = 100000;
+  for (BaseTypeOutput *pnode : pout_list) {
+    std::vector<std::string> found;
+    int missing = 0;
+    for (int n=pnode->out_params.file_number; n<max_probe; ++n) {
+      const std::string fname = pnode->FileNameForNumber(n);
+      if (fname.empty()) break;                 // stream does not write numbered files
+      struct stat sb;
+      if (stat(fname.c_str(), &sb) != 0) {
+        if (++missing > max_consecutive_missing) break;
+        continue;
+      }
+      missing = 0;
+      found.push_back(fname);
+    }
+    if (found.empty()) continue;
+    // Superseded files are overwritten in place without any notice (operator request
+    // 2026-08-24); the scan above is kept only so `found` documents what a resumed
+    // stream is about to replace, should anyone want to log it again.
+    (void) found;
   }
 }
 

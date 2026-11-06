@@ -48,6 +48,7 @@ minkowski = true
 <mhd>
 eos         = ideal
 reconstruct = ppmx
+fofc        = true
 rsolver     = hlle
 gamma       = 2.0     # ratio of specific heats Gamma
 

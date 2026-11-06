@@ -13,7 +13,6 @@
 #include <string>
 
 #include "athena.hpp"
-#include "diffusion/sts_types.hpp"
 #include "parameter_input.hpp"
 #include "mesh/mesh.hpp"
 
@@ -30,15 +29,18 @@ class Viscosity {
   Real dtnew;
   Real nu_iso;      // coefficient of isotropic kinematic shear viscosity
   Real nu_aniso;    // coefficient of anisotropic kinematic shear viscosity
-  parabolic::DiffusionSelection mode = parabolic::DiffusionSelection::explicit_only;
 
-  // function to add viscous fluxes to Hydro and/or MHD fluxes
+  // function to add viscous fluxes to Hydro and/or MHD fluxes.  The flux register is
+  // taken on its storage band (MHD keeps uflx on the flux band, mhd.hpp FluxBand); a
+  // ghost-extended register (Hydro) is the zero-origin band, via the second overload.
+  void AddViscousFluxes(const DvceArray5D<Real> &w, const EOS_Data &eos,
+                        const BandFaceFld5D<Real> &f);
   void AddViscousFluxes(const DvceArray5D<Real> &w, const EOS_Data &eos,
                         DvceFaceFld5D<Real> &f);
   void AddViscousFluxIso(const DvceArray5D<Real> &w,const EOS_Data &eos,
-                         DvceFaceFld5D<Real> &f);
+                         const BandFaceFld5D<Real> &f);
   void AddViscousFluxAniso(const DvceArray5D<Real> &w,const EOS_Data &eos,
-                           DvceFaceFld5D<Real> &f);
+                           const BandFaceFld5D<Real> &f);
   void NewTimeStep(const DvceArray5D<Real> &w, const EOS_Data &eos_data);
 
  private:

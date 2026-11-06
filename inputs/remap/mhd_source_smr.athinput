@@ -1,0 +1,70 @@
+<comment>
+problem = remap battery: MHD analytic source (remap_test source mode).  Writes the
+source restart at cycle 0.  Resolution overridden from the command line per case.
+
+<job>
+basename = RTSrcSMR
+
+<mesh>
+nghost = 2
+nx1 = 48
+x1min = -1.0
+x1max = 1.0
+ix1_bc = outflow
+ox1_bc = outflow
+
+nx2 = 48
+x2min = -1.0
+x2max = 1.0
+ix2_bc = outflow
+ox2_bc = outflow
+
+nx3 = 48
+x3min = -1.0
+x3max = 1.0
+ix3_bc = outflow
+ox3_bc = outflow
+
+<meshblock>
+nx1 = 16
+nx2 = 16
+nx3 = 16
+
+<mesh_refinement>
+refinement = static
+num_levels = 2
+
+# region strictly inside root block 0 per dim (48^3 mesh, 16^3 blocks: root blocks
+# span [-1,-1/3,1/3,1]); level-1 slots 0..1 need no parity widening, so exactly ONE
+# root-block octant refines and real fine/coarse interfaces exist at the -1/3 planes.
+<refined_region0>
+level = 1
+x1min = -0.9
+x1max = -0.6
+x2min = -0.9
+x2max = -0.6
+x3min = -0.9
+x3max = -0.6
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.3
+nlim = 0
+tlim = 10.0
+ndiag = 1
+
+<mhd>
+eos = ideal
+gamma = 1.6666666666666667
+reconstruct = plm
+rsolver = hlld
+dfloor = 1.0e-8
+pfloor = 1.0e-10
+
+<problem>
+pgen_name = remap_test
+
+<output1>
+file_type = rst
+dt = 1.0

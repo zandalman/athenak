@@ -4,9 +4,110 @@
 # Licensed under the 3-clause BSD License (the "LICENSE")
 #=========================================================================================
 
-# list of files to be compiled into executable name
-add_executable(
-    athena
+# custom problem generator to be included in compile
+# specify on command line using '-D PROBLEM=file' where 'file' is name of file in
+# pgen/ directory (not including .cpp extension)
+if (NOT ${PROBLEM} STREQUAL "built_in_pgens")
+  set(ATHENA_PROBLEM_SOURCES pgen/${PROBLEM}.cpp)
+  set(ATHENA_TEST_PGEN_SOURCES)
+else()
+  # The test and unit-test problem generators: only the built-in dispatch
+  # (ProblemGenerator::CallProblemGenerator) calls them, so a build with its own problem
+  # generator does not compile them.
+  set(ATHENA_PROBLEM_SOURCES)
+  set(ATHENA_TEST_PGEN_SOURCES
+          pgen/tests/advection.cpp
+          pgen/tests/collapse.cpp
+          pgen/tests/cpaw.cpp
+          pgen/tests/cshock.cpp
+          pgen/tests/diffusion.cpp
+          pgen/tests/gr_bondi.cpp
+          pgen/tests/gr_monopole.cpp
+          pgen/tests/linear_wave.cpp
+          pgen/tests/lw_implode.cpp
+          pgen/tests/orszag_tang.cpp
+          pgen/tests/mri3d.cpp
+          pgen/tests/shock_tube.cpp
+          pgen/tests/shwave.cpp
+          pgen/tests/rad_beam.cpp
+          pgen/tests/rad_linear_wave.cpp
+          pgen/tests/z4c_boosted_puncture.cpp
+          pgen/tests/z4c_linear_wave.cpp
+          pgen/tests/jeans_wave.cpp
+          pgen/tests/binary_gravity.cpp
+          pgen/tests/be_collapse.cpp
+          pgen/tests/polytropic_star.cpp
+          pgen/tests/remap_test.cpp
+          pgen/unit_tests/eos_compose.cpp
+          pgen/unit_tests/gauss_legendre.cpp
+          pgen/unit_tests/hydro_plm.cpp
+  )
+endif()
+
+# Everything that does not depend on the problem generator is compiled once into the
+# object library athena_core.  Each executable (athena for PROBLEM, athena_<name> for each
+# ATHENA_EXTRA_PROBLEMS entry) is athena_core's objects plus its own problem-generator
+# sources and pgen/problem_name.cpp, which carries the problem's name.
+# athena_usage carries the include directories, definitions and libraries every unit needs
+# (the top-level CMakeLists.txt adds the external libraries to it).
+add_library(athena_usage INTERFACE)
+target_include_directories(athena_usage INTERFACE ${CMAKE_CURRENT_SOURCE_DIR})
+
+# Per-executable objects: the problem sources, then the name unit.  They are defined before
+# athena_core so that a parallel make starts the (often heavy) problem generator at once.
+function(athena_add_problem_objects target pgen_name)
+  add_library(${target}_pgen OBJECT ${ARGN})
+  target_link_libraries(${target}_pgen PRIVATE athena_usage)
+  add_library(${target}_name OBJECT pgen/problem_name.cpp)
+  target_link_libraries(${target}_name PRIVATE athena_usage)
+  target_compile_definitions(${target}_name PRIVATE
+      "ATHENA_PROBLEM_NAME=\"${pgen_name}\"")
+endfunction()
+
+athena_add_problem_objects(athena "${PROBLEM}"
+    ${ATHENA_PROBLEM_SOURCES} ${ATHENA_TEST_PGEN_SOURCES})
+
+set(ATHENA_EXTRA_TARGETS)
+foreach(entry IN LISTS ATHENA_EXTRA_RESOLVED)
+  string(REGEX REPLACE "=.*$" "" extra_name "${entry}")
+  string(REGEX REPLACE "^[^=]*=" "" extra_path "${entry}")
+  athena_add_problem_objects(athena_${extra_name} "${extra_path}" pgen/${extra_path}.cpp)
+  list(APPEND ATHENA_EXTRA_TARGETS athena_${extra_name})
+endforeach()
+set(ATHENA_EXTRA_TARGETS ${ATHENA_EXTRA_TARGETS} PARENT_SCOPE)
+
+# list of files compiled once into athena_core.  The heaviest units come first so that a
+# parallel make starts them at once: the dyn-GR flux and FOFC, the GRMHD recovery and the
+# GR MHD face-flux units.
+add_library(athena_core OBJECT
+        dyn_grmhd/dyn_grmhd_fluxes_ideal_llf.cpp
+        dyn_grmhd/dyn_grmhd_fluxes_ideal_hlle.cpp
+        dyn_grmhd/dyn_grmhd_fluxes_ideal_hlld.cpp
+        dyn_grmhd/dyn_grmhd_fluxes_piecewise_poly.cpp
+        dyn_grmhd/dyn_grmhd_fluxes_compose_logs.cpp
+        dyn_grmhd/dyn_grmhd_fluxes_compose_nqt.cpp
+        dyn_grmhd/dyn_grmhd_fluxes_eoshybrid_logs.cpp
+        dyn_grmhd/dyn_grmhd_fluxes_eoshybrid_nqt.cpp
+        dyn_grmhd/dyn_grmhd_fofc_ideal_llf.cpp
+        dyn_grmhd/dyn_grmhd_fofc_ideal_hlle.cpp
+        dyn_grmhd/dyn_grmhd_fofc_piecewise_poly.cpp
+        dyn_grmhd/dyn_grmhd_fofc_compose_logs.cpp
+        dyn_grmhd/dyn_grmhd_fofc_compose_nqt.cpp
+        dyn_grmhd/dyn_grmhd_fofc_eoshybrid_logs.cpp
+        dyn_grmhd/dyn_grmhd_fofc_eoshybrid_nqt.cpp
+        eos/ideal_grmhd_c2p_main.cpp
+        eos/ideal_grmhd_c2p_floors_hybrid.cpp
+        mhd/mhd_fluxes_llf_gr.cpp
+        mhd/mhd_fluxes_llf_gr_x2.cpp
+        mhd/mhd_fluxes_llf_gr_x3.cpp
+        mhd/mhd_fluxes_hlle_gr.cpp
+        mhd/mhd_fluxes_hlle_gr_x2.cpp
+        mhd/mhd_fluxes_hlle_gr_x3.cpp
+        mhd/mhd_fluxes_hlld_gr.cpp
+        mhd/mhd_fluxes_hlld_gr_x2.cpp
+        mhd/mhd_fluxes_hlld_gr_x3.cpp
+        mhd/mhd_fluxes_excision.cpp
+
         main.cpp
         globals.cpp
         parameter_input.cpp
@@ -20,6 +121,7 @@ add_executable(
         bvals/bvals_tasks.cpp
         bvals/flux_correct_cc.cpp
         bvals/flux_correct_fc.cpp
+        bvals/lat_coarse_flux.cpp
         bvals/prolongation.cpp
         bvals/prolong_prims.cpp
         bvals/physics/hydro_bcs.cpp
@@ -30,33 +132,26 @@ add_executable(
         coordinates/adm.cpp
         coordinates/coordinates.cpp
         coordinates/excision.cpp
-
-        cyclic_zoom/cyclic_zoom.cpp
-        cyclic_zoom/zoom_criteria.cpp
-        cyclic_zoom/zoom_data.cpp
-        cyclic_zoom/zoom_datablock.cpp
-        cyclic_zoom/zoom_fluxes.cpp
-        cyclic_zoom/zoom_loadbalance.cpp
-        cyclic_zoom/zoom_mesh.cpp
-        cyclic_zoom/zoom_refinement.cpp
-        cyclic_zoom/zoom_region.cpp
-        cyclic_zoom/zoom_restart.cpp
-        cyclic_zoom/zoom_srcterms.cpp
+        coordinates/kerr_hole.cpp
 
         diffusion/ambipolar.cpp
         diffusion/conduction.cpp
         diffusion/resistivity.cpp
-        diffusion/sts_rkl2.cpp
         diffusion/viscosity.cpp
 
         driver/driver.cpp
 
         dyn_grmhd/dyn_grmhd.cpp
-        dyn_grmhd/dyn_grmhd_fluxes.cpp
-        dyn_grmhd/dyn_grmhd_fofc.cpp
+        dyn_grmhd/dyn_grmhd_ps_ideal.cpp
+        dyn_grmhd/dyn_grmhd_coord_terms_ideal.cpp
+        dyn_grmhd/dyn_grmhd_ps_piecewise_poly.cpp
+        dyn_grmhd/dyn_grmhd_ps_compose.cpp
+        dyn_grmhd/dyn_grmhd_ps_eoshybrid.cpp
 
         eos/eos.cpp
         eos/ideal_hyd.cpp
+        eos/saha_table_hyd.cpp
+        eos/saha_table_mhd.cpp
         eos/ideal_mhd.cpp
         eos/isothermal_hyd.cpp
         eos/isothermal_mhd.cpp
@@ -67,6 +162,7 @@ add_executable(
         eos/noop_dyngrmhd.cpp
         eos/primitive-solver/eos_compose.cpp
         eos/primitive-solver/eos_hybrid.cpp
+        eos/primitive-solver/eos_lte_table.cpp
         eos/primitive-solver/piecewise_polytrope.cpp
         eos/primitive-solver/unit_system.cpp
 
@@ -75,13 +171,25 @@ add_executable(
         geodesic-grid/gauss_legendre.cpp
 
         gravity/gravity.cpp
+        gravity/gr_selfgravity_fluid.cpp
         gravity/mg_gravity.cpp
+        gravity/gr_selfgravity.cpp
 
         hydro/hydro.cpp
-        hydro/hydro_fluxes.cpp
+        hydro/hydro_dual_energy.cpp
+        hydro/hydro_fluxes_advect.cpp
+        hydro/hydro_fluxes_llf.cpp
+        hydro/hydro_fluxes_hlle.cpp
+        hydro/hydro_fluxes_hllc.cpp
+        hydro/hydro_fluxes_roe.cpp
+        hydro/hydro_fluxes_llf_sr.cpp
+        hydro/hydro_fluxes_hlle_sr.cpp
+        hydro/hydro_fluxes_hllc_sr.cpp
+        hydro/hydro_fluxes_llf_gr.cpp
+        hydro/hydro_fluxes_hlle_gr.cpp
+        hydro/hydro_fluxes_excision.cpp
         hydro/hydro_fofc.cpp
         hydro/hydro_newdt.cpp
-        hydro/hydro_sts.cpp
         hydro/hydro_tasks.cpp
         hydro/hydro_update.cpp
 
@@ -89,6 +197,7 @@ add_executable(
         ion-neutral/ion-neutral_tasks.cpp
 
         mesh/build_tree.cpp
+        mesh/lat_partition.cpp
         mesh/load_balance.cpp
         mesh/mesh.cpp
         mesh/meshblock.cpp
@@ -98,17 +207,22 @@ add_executable(
         mesh/refinement_criteria.cpp
 
         multigrid/multigrid.cpp
-        multigrid/multigrid_bvals.cpp
         multigrid/multigrid_driver.cpp
         multigrid/multigrid_tasks.cpp
 
         mhd/mhd.cpp
         mhd/mhd_corner_e.cpp
         mhd/mhd_ct.cpp
-        mhd/mhd_fluxes.cpp
+        mhd/mhd_dual_energy.cpp
+        mhd/mhd_fluxes_advect.cpp
+        mhd/mhd_fluxes_llf.cpp
+        mhd/mhd_fluxes_hlle.cpp
+        mhd/mhd_fluxes_hlld.cpp
+        mhd/mhd_fluxes_llf_sr.cpp
+        mhd/mhd_fluxes_hlle_sr.cpp
+        mhd/mhd_fluxes_hlld_sr.cpp
         mhd/mhd_fofc.cpp
         mhd/mhd_newdt.cpp
-        mhd/mhd_sts.cpp
         mhd/mhd_tasks.cpp
         mhd/mhd_update.cpp
 
@@ -134,29 +248,6 @@ add_executable(
         outputs/pdf.cpp
 
         pgen/pgen.cpp
-        pgen/tests/advection.cpp
-        pgen/tests/cpaw.cpp
-        pgen/tests/cshock.cpp
-        pgen/tests/divb_amr.cpp
-        pgen/tests/diffusion.cpp
-        pgen/tests/gr_bondi.cpp
-        pgen/tests/gr_monopole.cpp
-        pgen/tests/linear_wave.cpp
-        pgen/tests/lw_implode.cpp
-        pgen/tests/orszag_tang.cpp
-        pgen/tests/mri3d.cpp
-        pgen/tests/shock_tube.cpp
-        pgen/tests/shwave.cpp
-        pgen/tests/rad_beam.cpp
-        pgen/tests/rad_linear_wave.cpp
-        pgen/tests/z4c_boosted_puncture.cpp
-        pgen/tests/z4c_linear_wave.cpp
-        pgen/tests/jeans_wave.cpp
-        pgen/tests/binary_gravity.cpp
-        pgen/tests/be_collapse.cpp
-
-        pgen/unit_tests/eos_compose.cpp
-        pgen/unit_tests/gauss_legendre.cpp
 
         radiation/radiation.cpp
         radiation/radiation_fluxes.cpp
@@ -165,6 +256,22 @@ add_executable(
         radiation/radiation_tasks.cpp
         radiation/radiation_tetrad.cpp
         radiation/radiation_update.cpp
+
+
+
+        sink_particles/sink_particles.cpp
+        sink_particles/sink_particles_tasks.cpp
+        sink_particles/sink_particles_gravity.cpp
+        sink_particles/sink_particles_accrete.cpp
+        sink_particles/sink_particles_create.cpp
+        sink_particles/sink_particles_merge.cpp
+        sink_particles/sink_particles_nbody.cpp
+
+        remap/remap.cpp
+        remap/remap_load.cpp
+        remap/remap_cc.cpp
+        remap/remap_fc.cpp
+        remap/remap_expand.cpp
 
         shearing_box/orbital_advection.cpp
         shearing_box/orbital_advection_cc.cpp
@@ -182,17 +289,17 @@ add_executable(
 
         tasklist/numerical_relativity.cpp
 
+
         units/units.cpp
         utils/change_rundir.cpp
+        utils/data_path.cpp
         utils/derived_vars.cpp
         utils/show_config.cpp
         utils/lagrange_interpolator.cpp
         utils/tov/tov.cpp
         utils/tr_table.cpp
         utils/cart_grid.cpp
-        utils/watchdog.cpp
         utils/spherical_surface.cpp
-
 
         z4c/compact_object_tracker.cpp
         z4c/fastflow.cpp
@@ -210,19 +317,16 @@ add_executable(
         z4c/z4c_wave_extr.cpp
         z4c/z4c_amr.cpp
         z4c/cce/cce.cpp
-        z4c/driftcontrol/driftcontrol.cpp
 )
+target_link_libraries(athena_core PRIVATE athena_usage)
 
-# custom problem generator to be included in compile
-# specify on command line using '-D PROBLEM=file' where 'file' is name of file in
-# pgen/ directory (not including .cpp extension)
+# ResolveDataPath's last place to look for a table a deck names by a relative path is the
+# source tree's data/ directory (utils/data_path.hpp).
+set_source_files_properties(utils/data_path.cpp PROPERTIES COMPILE_DEFINITIONS
+    "ATHENAK_SOURCE_DIR=\"${CMAKE_SOURCE_DIR}\"")
 
-if (NOT ${PROBLEM} STREQUAL "built_in_pgens")
-  target_sources(athena
-      PRIVATE
-          pgen/${PROBLEM}.cpp
-  )
-endif()
-
-# enable include of header files with /src/ as root of path
-target_include_directories(athena PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+foreach(exe athena ${ATHENA_EXTRA_TARGETS})
+  add_executable(${exe} $<TARGET_OBJECTS:athena_core> $<TARGET_OBJECTS:${exe}_pgen>
+                 $<TARGET_OBJECTS:${exe}_name>)
+  target_link_libraries(${exe} PUBLIC athena_usage)
+endforeach()

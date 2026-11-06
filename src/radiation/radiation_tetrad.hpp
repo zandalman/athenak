@@ -11,13 +11,18 @@
 #include <math.h>
 
 #include "athena.hpp"
+#include "coordinates/kerr_hole_type.hpp"
 
 // computes covariant and contravariant components of Cartesian tetrad for CKS
 KOKKOS_INLINE_FUNCTION
-void ComputeTetrad(Real x, Real y, Real z, const bool minkowski, const Real a,
+void ComputeTetrad(Real x, Real y, Real z, const KerrHole &h,
                    Real g[][4], Real gi[][4], Real dgx[][4], Real dgy[][4], Real dgz[][4],
                    Real e[][4], Real ecov[][4], Real omega[][4][4]) {
   // if (fabs(z) < (SMALL_NUMBER)) z = (SMALL_NUMBER);  // see cartesian_ks.hpp comments
+  // KS is scale free: evaluate on (x, y, z, a)/M, derivatives scaled back by 1/M.
+  const Real im = 1.0/h.m;
+  x *= im; y *= im; z *= im;
+  const Real a = h.a*im;
   Real rad = sqrt(SQR(x) + SQR(y) + SQR(z));
   Real r = sqrt((SQR(rad)-SQR(a)+sqrt(SQR(SQR(rad)-SQR(a))+4.0*SQR(a)*SQR(z)))/2.0);
   r = fmax(r, 1.0);  // floor r_ks to 0.5*(r_inner + r_outer)
@@ -26,7 +31,7 @@ void ComputeTetrad(Real x, Real y, Real z, const bool minkowski, const Real a,
   Real ll2 = (r*y - (a)*x)/( SQR(r) + SQR(a) );
   Real ll3 = z/r;
   Real f = 2.0 * SQR(r)*r / (SQR(SQR(r)) + SQR(a)*SQR(z));
-  if (minkowski) {f=0.0;}
+  if (h.minkowski) {f=0.0;}
 
   // Set Cartesian tetrad
   Real wa = sqrt(1.0+f);
@@ -60,7 +65,7 @@ void ComputeTetrad(Real x, Real y, Real z, const bool minkowski, const Real a,
   Real df_dx1 = SQR(f)*x/(2.0*pow(r,3)) * ( ( qc ) )/ qa;
   Real df_dx2 = SQR(f)*y/(2.0*pow(r,3)) * ( ( qc ) )/ qa;
   Real df_dx3 = SQR(f)*z/(2.0*pow(r,5)) * ( ( qc * qb ) / qa - 2.0*SQR(a*r));
-  if (minkowski) {
+  if (h.minkowski) {
     f = 0.0;
     df_dx1 = 0.0;
     df_dx2 = 0.0;
@@ -123,6 +128,14 @@ void ComputeTetrad(Real x, Real y, Real z, const bool minkowski, const Real a,
   de[3][3][2]  = -f*iwa*iwb*ll2*dl3_dx3 - f*iwa*iwb*ll3*dl2_dx3;
   de[3][3][2] += (-iwa*iwb*df_dx3 + f*iwasq*iwb*dwa_dx3 + f*iwa*iwbsq*dwb_dx3)*ll2*ll3;
   de[3][3][3]  = iwa*dwb_dx3 - iwasq*wb*dwa_dx3;
+  // de was built from derivatives with respect to the scaled coordinates x/M
+  for (int i = 1; i < 4; ++i) {
+    for (int j = 0; j < 4; ++j) {
+      for (int k = 0; k < 4; ++k) {
+        de[i][j][k] *= im;
+      }
+    }
+  }
 
   // Stow metric derivatives in a temporary array
   Real dg[4][4][4] = {};

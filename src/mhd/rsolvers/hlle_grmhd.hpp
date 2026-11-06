@@ -16,51 +16,55 @@
 
 #include "coordinates/cartesian_ks.hpp"
 #include "coordinates/cell_locations.hpp"
+#include "eos/grmhd_fast_speeds.hpp"
 
 namespace mhd {
 //----------------------------------------------------------------------------------------
 //! \fn HLLE_GR<ivx>()
-//! \brief The HLLE Riemann solver for GR MHD, single face (m,k,j,i).
-template <int ivx>
+//! \brief The HLLE Riemann solver for GR MHD, single face (m,k,j,i).  The adiabatic
+//! index of each wall is the caller's: eos.gamma for a constant-gamma run, the gamma the
+//! wall's own closure formed (the face preparation) for a
+//! variable one, so the pressure here is the wall's (gamma - 1) e.
+template <int ivx, bool capture_speeds = false>
 KOKKOS_INLINE_FUNCTION
-void HLLE_GR(const EOS_Data &eos, const RegionIndcs &indcs,
+void HLLE_GR(const RegionIndcs &indcs,
              const DualArray1D<RegionSize> &size, const CoordData &coord,
-             const int m, const int k, const int j, const int i,
+             const int m, const int mb, const int k, const int j, const int i,
              const int is, const int js, const int ks,
              const DvceArray5D<Real> &wl, const DvceArray5D<Real> &wr,
              const DvceArray5D<Real> &bl, const DvceArray5D<Real> &br,
              const DvceArray4D<Real> &bx,
-             const DvceArray5D<Real> &flx,
-             const DvceArray4D<Real> &ey, const DvceArray4D<Real> &ez) {
+             const BandView5D<Real> &flx,
+             const BandView4D<Real> &ey, const BandView4D<Real> &ez,
+             const Real gamma_l, const Real gamma_r,
+             Real *lambda_l_out = nullptr, Real *lambda_r_out = nullptr) {
   constexpr int ivy = IVX + ((ivx-IVX)+1)%3;
   constexpr int ivz = IVX + ((ivx-IVX)+2)%3;
   constexpr int iby = ((ivx-IVX) + 1)%3;
   constexpr int ibz = ((ivx-IVX) + 2)%3;
 
-  const Real gm1 = (eos.gamma - 1.0);
-  const Real gamma_prime = eos.gamma/(gm1);
-  auto &flat = coord.is_minkowski;
-  auto &spin = coord.bh_spin;
+  const KerrHole hole = coord.Hole();
 
 
   // Left/right primitives
-  Real wl_idn = wl(m,IDN,k,j,i);
-  Real wl_ivx = wl(m,ivx,k,j,i);
-  Real wl_ivy = wl(m,ivy,k,j,i);
-  Real wl_ivz = wl(m,ivz,k,j,i);
-  Real wl_iby = bl(m,iby,k,j,i);
-  Real wl_ibz = bl(m,ibz,k,j,i);
+  Real wl_idn = wl(mb,IDN,k,j,i);
+  Real wl_ivx = wl(mb,ivx,k,j,i);
+  Real wl_ivy = wl(mb,ivy,k,j,i);
+  Real wl_ivz = wl(mb,ivz,k,j,i);
+  Real wl_iby = bl(mb,iby,k,j,i);
+  Real wl_ibz = bl(mb,ibz,k,j,i);
 
-  Real wr_idn = wr(m,IDN,k,j,i);
-  Real wr_ivx = wr(m,ivx,k,j,i);
-  Real wr_ivy = wr(m,ivy,k,j,i);
-  Real wr_ivz = wr(m,ivz,k,j,i);
-  Real wr_iby = br(m,iby,k,j,i);
-  Real wr_ibz = br(m,ibz,k,j,i);
+  Real wr_idn = wr(mb,IDN,k,j,i);
+  Real wr_ivx = wr(mb,ivx,k,j,i);
+  Real wr_ivy = wr(mb,ivy,k,j,i);
+  Real wr_ivz = wr(mb,ivz,k,j,i);
+  Real wr_iby = br(mb,iby,k,j,i);
+  Real wr_ibz = br(mb,ibz,k,j,i);
 
-  Real wl_ipr, wr_ipr;
-  wl_ipr = eos.IdealGasPressure(wl(m,IEN,k,j,i));
-  wr_ipr = eos.IdealGasPressure(wr(m,IEN,k,j,i));
+  const Real gamma_prime_l = gamma_l/(gamma_l - 1.0);
+  const Real gamma_prime_r = gamma_r/(gamma_r - 1.0);
+  Real wl_ipr = (gamma_l - 1.0) * wl(mb,IEN,k,j,i);
+  Real wr_ipr = (gamma_r - 1.0) * wr(mb,IEN,k,j,i);
 
   // longitudinal field
   Real bxi = bx(m,k,j,i);
@@ -86,35 +90,31 @@ void HLLE_GR(const EOS_Data &eos, const RegionIndcs &indcs,
     x2v = CellCenterX(j-js, indcs.nx2, x2min, x2max);
     x3v = LeftEdgeX  (k-ks, indcs.nx3, x3min, x3max);
   }
-  Real glower[4][4], gupper[4][4];
-  ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper);
+  // Compact Kerr-Schild null form: g_{mu nu} = eta_{mu nu} + f l_mu l_nu (l_0 = 1) and
+  // g^{mu nu} = eta^{mu nu} - f l^mu l^nu (l^0 = -1, l^i = l_i).  Carrying (f,l1,l2,l3)
+  // instead of glower[4][4]/gupper[4][4] keeps 4 live doubles in place of 32; every
+  // component used below is recovered exactly by the accessors in cartesian_ks.hpp.
+  KSNullForm nf;
+  ComputeKSNullForm(x1v, x2v, x3v, hole, nf);
 
   // Calculate 4-velocity in left state (contravariant compt)
-  Real q = glower[ivx][ivx] * SQR(wl_ivx) + glower[ivy][ivy] * SQR(wl_ivy) +
-           glower[ivz][ivz] * SQR(wl_ivz) + 2.0*glower[ivx][ivy] * wl_ivx * wl_ivy +
-       2.0*glower[ivx][ivz] * wl_ivx * wl_ivz + 2.0*glower[ivy][ivz] * wl_ivy * wl_ivz;
+  // q = gamma_ij v^i v^j = |v|^2 + f (l_i v^i)^2
+  Real q = KSSpatialNormSq(nf, ivx, ivy, ivz, wl_ivx, wl_ivy, wl_ivz);
 
-  Real alpha = std::sqrt(-1.0/gupper[0][0]);
+  // alpha = sqrt(-1/g^{00}) with g^{00} = -(1+f)
+  Real alpha = KSAlpha(nf);
   Real gamma = sqrt(1.0 + q);
   Real uul[4];
   uul[0] = gamma / alpha;
-  uul[ivx] = wl_ivx - alpha * gamma * gupper[0][ivx];
-  uul[ivy] = wl_ivy - alpha * gamma * gupper[0][ivy];
-  uul[ivz] = wl_ivz - alpha * gamma * gupper[0][ivz];
+  Real ag = alpha * gamma;
+  uul[ivx] = wl_ivx - ag * KSGupper0i(nf, ivx);
+  uul[ivy] = wl_ivy - ag * KSGupper0i(nf, ivy);
+  uul[ivz] = wl_ivz - ag * KSGupper0i(nf, ivz);
 
-  // lower vector indices (covariant compt)
+  // lower vector indices (covariant compt): A_mu = eta_{mu nu} A^nu + f l_mu (l.A)
   Real ull[4];
-  ull[0]   = glower[0][0]  *uul[0]   + glower[0][ivx]*uul[ivx] +
-             glower[0][ivy]*uul[ivy] + glower[0][ivz]*uul[ivz];
-
-  ull[ivx] = glower[ivx][0]  *uul[0]   + glower[ivx][ivx]*uul[ivx] +
-             glower[ivx][ivy]*uul[ivy] + glower[ivx][ivz]*uul[ivz];
-
-  ull[ivy] = glower[ivy][0]  *uul[0]   + glower[ivy][ivx]*uul[ivx] +
-             glower[ivy][ivy]*uul[ivy] + glower[ivy][ivz]*uul[ivz];
-
-  ull[ivz] = glower[ivz][0]  *uul[0]   + glower[ivz][ivx]*uul[ivx] +
-             glower[ivz][ivy]*uul[ivy] + glower[ivz][ivz]*uul[ivz];
+  KSLowerVec(nf, ivx, ivy, ivz, uul[0], uul[ivx], uul[ivy], uul[ivz],
+             ull[0], ull[ivx], ull[ivy], ull[ivz]);
 
   // calculate 4-magnetic field in left state (contravariant compt)
   Real bul[4];
@@ -125,45 +125,26 @@ void HLLE_GR(const EOS_Data &eos, const RegionIndcs &indcs,
 
   // lower vector indices (covariant compt)
   Real bll[4];
-  bll[0]   = glower[0][0]  *bul[0]   + glower[0][ivx]*bul[ivx] +
-             glower[0][ivy]*bul[ivy] + glower[0][ivz]*bul[ivz];
-
-  bll[ivx] = glower[ivx][0]  *bul[0]   + glower[ivx][ivx]*bul[ivx] +
-             glower[ivx][ivy]*bul[ivy] + glower[ivx][ivz]*bul[ivz];
-
-  bll[ivy] = glower[ivy][0]  *bul[0]   + glower[ivy][ivx]*bul[ivx] +
-             glower[ivy][ivy]*bul[ivy] + glower[ivy][ivz]*bul[ivz];
-
-  bll[ivz] = glower[ivz][0]  *bul[0]   + glower[ivz][ivx]*bul[ivx] +
-             glower[ivz][ivy]*bul[ivy] + glower[ivz][ivz]*bul[ivz];
+  KSLowerVec(nf, ivx, ivy, ivz, bul[0], bul[ivx], bul[ivy], bul[ivz],
+             bll[0], bll[ivx], bll[ivy], bll[ivz]);
 
   Real bsq_l = bll[0]*bul[0] + bll[ivx]*bul[ivx] + bll[ivy]*bul[ivy] +bll[ivz]*bul[ivz];
 
   // Calculate 4-velocity in right state (contravariant compt)
-  q = glower[ivx][ivx] * SQR(wr_ivx) + glower[ivy][ivy] * SQR(wr_ivy) +
-      glower[ivz][ivz] * SQR(wr_ivz) + 2.0*glower[ivx][ivy] * wr_ivx * wr_ivy +
-      2.0*glower[ivx][ivz] * wr_ivx * wr_ivz + 2.0*glower[ivy][ivz] * wr_ivy * wr_ivz;
+  q = KSSpatialNormSq(nf, ivx, ivy, ivz, wr_ivx, wr_ivy, wr_ivz);
 
   gamma = sqrt(1.0 + q);
   Real uur[4];
   uur[0] = gamma / alpha;
-  uur[ivx] = wr_ivx - alpha * gamma * gupper[0][ivx];
-  uur[ivy] = wr_ivy - alpha * gamma * gupper[0][ivy];
-  uur[ivz] = wr_ivz - alpha * gamma * gupper[0][ivz];
+  ag = alpha * gamma;
+  uur[ivx] = wr_ivx - ag * KSGupper0i(nf, ivx);
+  uur[ivy] = wr_ivy - ag * KSGupper0i(nf, ivy);
+  uur[ivz] = wr_ivz - ag * KSGupper0i(nf, ivz);
 
   // lower vector indices (covariant compt)
   Real ulr[4];
-  ulr[0]   = glower[0][0]  *uur[0]   + glower[0][ivx]*uur[ivx] +
-             glower[0][ivy]*uur[ivy] + glower[0][ivz]*uur[ivz];
-
-  ulr[ivx] = glower[ivx][0]  *uur[0]   + glower[ivx][ivx]*uur[ivx] +
-             glower[ivx][ivy]*uur[ivy] + glower[ivx][ivz]*uur[ivz];
-
-  ulr[ivy] = glower[ivy][0]  *uur[0]   + glower[ivy][ivx]*uur[ivx] +
-             glower[ivy][ivy]*uur[ivy] + glower[ivy][ivz]*uur[ivz];
-
-  ulr[ivz] = glower[ivz][0]  *uur[0]   + glower[ivz][ivx]*uur[ivx] +
-             glower[ivz][ivy]*uur[ivy] + glower[ivz][ivz]*uur[ivz];
+  KSLowerVec(nf, ivx, ivy, ivz, uur[0], uur[ivx], uur[ivy], uur[ivz],
+             ulr[0], ulr[ivx], ulr[ivy], ulr[ivz]);
 
   // Calculate 4-magnetic field in right state
   Real bur[4];
@@ -174,40 +155,41 @@ void HLLE_GR(const EOS_Data &eos, const RegionIndcs &indcs,
 
   // lower vector indices (covariant compt)
   Real blr[4];
-  blr[0]   = glower[0][0]  *bur[0]   + glower[0][ivx]*bur[ivx] +
-             glower[0][ivy]*bur[ivy] + glower[0][ivz]*bur[ivz];
-
-  blr[ivx] = glower[ivx][0]  *bur[0]   + glower[ivx][ivx]*bur[ivx] +
-             glower[ivx][ivy]*bur[ivy] + glower[ivx][ivz]*bur[ivz];
-
-  blr[ivy] = glower[ivy][0]  *bur[0]   + glower[ivy][ivx]*bur[ivx] +
-             glower[ivy][ivy]*bur[ivy] + glower[ivy][ivz]*bur[ivz];
-
-  blr[ivz] = glower[ivz][0]  *bur[0]   + glower[ivz][ivx]*bur[ivx] +
-             glower[ivz][ivy]*bur[ivy] + glower[ivz][ivz]*bur[ivz];
+  KSLowerVec(nf, ivx, ivy, ivz, bur[0], bur[ivx], bur[ivy], bur[ivz],
+             blr[0], blr[ivx], blr[ivy], blr[ivz]);
 
   Real bsq_r = blr[0]*bur[0] + blr[ivx]*bur[ivx] + blr[ivy]*bur[ivy] +blr[ivz]*bur[ivz];
 
-  // Calculate wavespeeds in left state
+  // Contravariant metric components entering the wavespeed solve
+  const Real gu00 = KSGupper00(nf);
+  const Real gu0x = KSGupper0i(nf, ivx);
+  const Real guxx = KSGupperij(nf, ivx, ivx);
+
+  // Calculate wavespeeds in left state.  Free-function form avoids copying all of
+  // EOS_Data (12 Views + ~40 scalars) twice per face just to set the local gamma.
   Real lp_l, lm_l;
-  eos.IdealGRMHDFastSpeeds(wl_idn, wl_ipr, uul[0], uul[ivx], bsq_l, gupper[0][0],
-                           gupper[0][ivx], gupper[ivx][ivx], lp_l, lm_l);
+  GRMHDFastSpeedsGamma(gamma_l, wl_idn, wl_ipr, uul[0], uul[ivx], bsq_l,
+                       gu00, gu0x, guxx, lp_l, lm_l);
 
   // Calculate wavespeeds in right state
   Real lp_r, lm_r;
-  eos.IdealGRMHDFastSpeeds(wr_idn, wr_ipr, uur[0], uur[ivx], bsq_r, gupper[0][0],
-                           gupper[0][ivx], gupper[ivx][ivx], lp_r, lm_r);
+  GRMHDFastSpeedsGamma(gamma_r, wr_idn, wr_ipr, uur[0], uur[ivx], bsq_r,
+                       gu00, gu0x, guxx, lp_r, lm_r);
 
   // Calculate extremal wavespeeds
   Real lambda_l = fmin(lm_l, lm_r);
   Real lambda_r = fmax(lp_l, lp_r);
+  if constexpr (capture_speeds) {
+    if (lambda_l_out != nullptr) *lambda_l_out = lambda_l;
+    if (lambda_r_out != nullptr) *lambda_r_out = lambda_r;
+  }
 
   // Calculate difference du =  U_R - U_l in conserved quantities (rho u^0 and T^0_\mu)
   MHDCons1D du;
-  Real wtot_r = wr_idn + gamma_prime * wr_ipr + bsq_r;
+  Real wtot_r = wr_idn + gamma_prime_r * wr_ipr + bsq_r;
   Real ptot_r = wr_ipr + 0.5*bsq_r;
   Real qa = wtot_r * uur[0];
-  Real wtot_l = wl_idn + gamma_prime * wl_ipr + bsq_l;
+  Real wtot_l = wl_idn + gamma_prime_l * wl_ipr + bsq_l;
   Real ptot_l = wl_ipr + 0.5*bsq_l;
   Real qb = wtot_l * uul[0];
   du.d  = (wr_idn*uur[0]) - (wl_idn*uul[0]);

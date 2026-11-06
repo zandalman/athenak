@@ -27,11 +27,11 @@ namespace hydro {
 template <int ivx>
 KOKKOS_INLINE_FUNCTION
 void HLLE_SR(const EOS_Data &eos,
-             const int m, const int k, const int j, const int i,
+             const int m, const int mb, const int k, const int j, const int i,
              const int is, const int js, const int ks,
              const DvceArray5D<Real> &wl,
              const DvceArray5D<Real> &wr,
-             const DvceArray5D<Real> &flx) {
+             const BandView5D<Real> &flx) {
   constexpr int ivy = IVX + ((ivx-IVX)+1)%3;
   constexpr int ivz = IVX + ((ivx-IVX)+2)%3;
   const Real gm1 = (eos.gamma - 1.0);
@@ -43,18 +43,18 @@ void HLLE_SR(const EOS_Data &eos,
   //   \rho is the mass density in the comoving/fluid frame,
   //   u^i = \gamma v^i are the spatial components of the 4-velocity (v^i is the 3-vel),
   //   P_g is the pressure.
-  Real wl_idn = wl(m,IDN,k,j,i);
-  Real wl_ivx = wl(m,ivx,k,j,i);
-  Real wl_ivy = wl(m,ivy,k,j,i);
-  Real wl_ivz = wl(m,ivz,k,j,i);
+  Real wl_idn = wl(mb,IDN,k,j,i);
+  Real wl_ivx = wl(mb,ivx,k,j,i);
+  Real wl_ivy = wl(mb,ivy,k,j,i);
+  Real wl_ivz = wl(mb,ivz,k,j,i);
 
-  Real wr_idn = wr(m,IDN,k,j,i);
-  Real wr_ivx = wr(m,ivx,k,j,i);
-  Real wr_ivy = wr(m,ivy,k,j,i);
-  Real wr_ivz = wr(m,ivz,k,j,i);
+  Real wr_idn = wr(mb,IDN,k,j,i);
+  Real wr_ivx = wr(mb,ivx,k,j,i);
+  Real wr_ivy = wr(mb,ivy,k,j,i);
+  Real wr_ivz = wr(mb,ivz,k,j,i);
 
-  Real wl_ipr = eos.IdealGasPressure(wl(m,IEN,k,j,i));
-  Real wr_ipr = eos.IdealGasPressure(wr(m,IEN,k,j,i));
+  Real wl_ipr = eos.IdealGasPressure(wl(mb,IEN,k,j,i));
+  Real wr_ipr = eos.IdealGasPressure(wr(mb,IEN,k,j,i));
 
   Real u2l = SQR(wl_ivz) + SQR(wl_ivy) + SQR(wl_ivx);
   Real u2r = SQR(wr_ivz) + SQR(wr_ivy) + SQR(wr_ivx);

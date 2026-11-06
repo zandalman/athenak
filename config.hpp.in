@@ -6,8 +6,6 @@
 // Licensed under the 3-clause BSD License (the "LICENSE")
 //========================================================================================
 
-// problem generator (string)
-#define PROBLEM_GENERATOR "@PROBLEM@"
 #define USER_PROBLEM_ENABLED @USER_PROBLEM_ENABLED@
 
 #define TWO_PUNCTURES @TWO_PUNCTURES@

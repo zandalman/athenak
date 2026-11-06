@@ -1,0 +1,162 @@
+<comment>
+problem   = TDE of a 1 Msun star by a 1000 Msun black hole, step 5 of 5 (fallback with LAT)
+reference = Jiang et al., End-to-End Numerical Framework for TDEs with AthenaK, ApJS, Table 1
+
+<job>
+basename = TDEExternalLTEPrad
+
+<mesh>
+nghost = 2
+nx1    = 128
+x1min  = -128
+x1max  = 384
+ix1_bc = outflow
+ox1_bc = outflow
+
+nx2    = 160
+x2min  = -192
+x2max  = 448
+ix2_bc = outflow
+ox2_bc = outflow
+
+nx3    = 32
+x3min  = -64
+x3max  = 64
+ix3_bc = outflow
+ox3_bc = outflow
+
+<meshblock>
+nx1 = 32
+nx2 = 32
+nx3 = 32
+
+<units>
+mass_cgs   = 1.98841586e33
+length_cgs = 1.3914e11
+time_cgs   = 1.2709152632111343e3
+mu         = 1.0
+
+<mesh_refinement>
+refinement          = adaptive
+num_levels          = 8
+ncycle_check        = 512
+refinement_interval = 512
+max_nmb_per_rank    = 520
+max_nmb_total       = 5200
+
+<amr_criterion0>
+method = user
+
+<tde_amr>
+cells_per_radian    = 64
+cells_per_thickness = 16
+spine_frac          = 0.1
+
+<refined_region0>
+level = 3
+x1min = -65
+x1max = 15
+x2min = -80
+x2max = 0
+x3min = -5
+x3max = 5
+
+<time>
+evolution  = dynamic
+integrator = rk2
+cfl_number = 0.5
+nlim       = -1
+tlim       = 440.2
+ndiag      = 1
+
+lat                      = true
+lat_levels               = 7
+lat_same_level           = true
+lat_same_level_max_ratio = 2
+lat_neighbor_limiter     = all
+lat_diagnostics          = false
+
+<hydro>
+eos              = lte_table_chabrier2021_t13_helm_union_prad
+table            = ../chabrier2021_t13_helm_union_prad_640.table
+reconstruct      = plm
+rsolver          = hlle
+dfloor           = 1.0e-10
+pfloor           = 1.0e-12
+tfloor_kelvin    = 1
+sfloor           = 0.0
+cs_ceil          = 15.0
+vceil            = 15.0
+fofc             = false
+dual_energy      = true
+dual_energy_eta1 = 1.0e-3
+dual_energy_eta2 = 1.0e-4
+lte_bounds       = clamp
+lte_debug_checks = false
+allow_reinterpretive_restart = true
+
+<gravity>
+self_gravity = true
+four_pi_G    = 1.0
+threshold    = 1e-10
+mg_bc        = multipole
+fmg_ncycle   = 1
+show_defect  = true
+npresmooth   = 1
+npostsmooth  = 2
+rho_grav_min = 1.0e-9
+solve_dt     = 0.03
+
+<remap>
+enable        = true
+source        = ../04_bh_frame/rst/TDEExternalLTEPrad.00016.rst
+settle_steps  = 10
+settle_passes = 1
+
+<problem>
+pgen_name = tde_external
+user_srcs = true
+
+star_radius            = 0.5
+poly_n                 = 1.5
+stellar_structure_mode = eos_balanced
+rho_floor              = 1.0e-10
+relax_damp             = true
+relax_tau              = 0.02
+relax_t_end            = 0.2
+relax_radius           = 0.5
+amp                    = 0.0
+x_center               = 0.0
+y_center               = 0.0
+z_center               = 0.0
+vx_star                = 0.0
+vy_star                = 0.0
+vz_star                = 0.0
+
+external_bh_gravity_source = true
+bh_live               = true
+bh_reciprocal_force   = true
+bh_pair_force         = finite_difference
+use_translating_frame = false
+frame_rho_min         = 1.0e-9
+bh_grav_rho_min       = 1.0e-9
+mass_ratio            = 1000.0
+beta                  = 1.0
+ecc_bh                = 1.0
+theta_bh              = 0.0
+sep_initial           = 10.0
+bh_softening          = 5.0e-3
+bh_excise_radius      = 0.2
+
+<output1>
+file_type = hst
+dt        = 0.1
+
+<output2>
+file_type = bin
+variable  = hydro_w
+dt        = 0.5
+
+<output3>
+file_type = rst
+dt        = 10.0

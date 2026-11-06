@@ -45,7 +45,7 @@
 #include "mhd/mhd.hpp"
 #include "dyn_grmhd/dyn_grmhd.hpp"
 #include "coordinates/adm.hpp"
-#include "pgen/pgen.hpp"
+#include "pgen.hpp"
 
 //----------------------------------------------------------------------------------------
 //! \fn ProblemGenerator::_()
@@ -170,6 +170,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
 
   // Initialize conserved variables and magnetic field in MHD
   if (pmbp->pmhd != nullptr) {
+    pmbp->pmhd->RequireField("The field_loop problem generator");
     bool shearing_box_ = pmbp->pmhd->psbox_u != nullptr;
     if (shearing_box_) {
       if (iprob != 1 && iprob != 4) {
@@ -310,7 +311,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
         Real& w_bz = bcc0(m,IBZ,k,j,i);
         w_bx = 0.5*(b0.x1f(m,k,j,i) + b0.x1f(m,k,j,i+1));
         w_by = 0.5*(b0.x2f(m,k,j,i) + b0.x2f(m,k,j+1,i));
-        w_bz = 0.0;
+        w_bz = 0.5*(b0.x3f(m,k,j,i) + b0.x3f(m,k+1,j,i));
       });
     }
 

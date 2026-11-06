@@ -14,6 +14,7 @@
 #include "athena.hpp"
 #include "parameter_input.hpp"
 #include "mesh/mesh.hpp"
+#include "coordinates/kerr_hole_type.hpp"
 
 // forward declarations
 struct EOS_Data;
@@ -33,19 +34,24 @@ enum class ExcisionScheme {
 
 struct CoordData {
   // following data is only used in GR calculations to compute metric
-  bool is_minkowski;               // flag to specify Minkowski (flat) space
-  Real bh_spin;                    // needed for GR metric
-  bool bh_excise;                  // flag to specify excision
-  Real rexcise;                    // excision radius (SKS)
-  Real dexcise;                    // rest-mass density inside excised region
-  Real pexcise;                    // pressure inside excised region
-  Real texcise;                    // temperature inside excised region (for smooth exc.)
-  Real flux_excise_r;              // reduce to first-order inside this radius
-  ExcisionScheme excision_scheme;  // excision method
-  Real excise_lapse;               // if excision_scheme = lapse, excise under this lapse
+  bool is_minkowski{true};               // flag to specify Minkowski (flat) space
+  Real bh_mass{1.0};                      // hole mass M of the GR metric
+  Real bh_spin{0.0};                      // spin length a = J/M of the GR metric
+  bool bh_excise{false};                  // flag to specify excision
+  Real rexcise{0.0};                      // excision radius (SKS)
+  Real dexcise{0.0};                      // rest-mass density inside excised region
+  Real pexcise{0.0};                      // pressure inside excised region
+  Real texcise{0.0};                      // temperature inside excised region (for smooth exc.)
+  Real flux_excise_r{0.0};                // reduce to first-order inside this radius
+  ExcisionScheme excision_scheme{ExcisionScheme::fixed};  // excision method
+  Real excise_lapse{0.0};                 // if excision_scheme = lapse, excise under this lapse
   bool smooth_excision = false;    // flag to specify smooth excision (fastflow)
-  Real horizon_factor;             // factor to muliply the horizon factor by (fastflow)
-  Real tdamp;                      // damping time (needed for smooth excision)
+  Real horizon_factor{1.0};         // factor to muliply the horizon factor by (fastflow)
+  Real tdamp{0.0};                  // damping time (needed for smooth excision)
+
+  // metric parameters (M, a) as passed to the Kerr-Schild metric and horizon functions
+  KOKKOS_INLINE_FUNCTION
+  KerrHole Hole() const { return {is_minkowski, bh_mass, bh_spin}; }
 };
 
 //----------------------------------------------------------------------------------------
@@ -65,7 +71,8 @@ class Coordinates {
   // data needed to compute metric in GR
   CoordData coord_data;
 
-  // excision masks
+  // excision masks.  On the fixed metric excision_floor is written once, by the
+  // constructor (SetExcisionMasks), so once per topology.
   DvceArray4D<bool> excision_floor;  // cell-centered mask for C2P flooring about horizon
   DvceArray4D<bool> excision_flux;   // cell-centered mask for FOFC about horizon
 
@@ -77,6 +84,7 @@ class Coordinates {
   void SetExcisionMasks(DvceArray4D<bool> &floor, DvceArray4D<bool> &flux);
 
   void UpdateExcisionMasks();
+  void CheckExcisionResolved();
 
  private:
   MeshBlockPack* pmy_pack;

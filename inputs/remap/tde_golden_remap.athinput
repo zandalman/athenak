@@ -1,0 +1,102 @@
+<comment>
+problem = T-G golden remap: consumes the tde_golden_source restart via <problem> remap
+onto a wider, finer-blocked target mesh, then dumps hydro_u at cycle 0 (nlim = 0).
+The dump must be identical before and after the remap-module refactor.
+See docs/design/remap_module_design.md.
+
+<job>
+basename = TDEGoldenRemap
+
+<mesh>
+nghost = 2
+nx1 = 96
+x1min = -12.0
+x1max = 12.0
+ix1_bc = outflow
+ox1_bc = outflow
+
+nx2 = 96
+x2min = -12.0
+x2max = 12.0
+ix2_bc = outflow
+ox2_bc = outflow
+
+nx3 = 96
+x3min = -12.0
+x3max = 12.0
+ix3_bc = outflow
+ox3_bc = outflow
+
+<meshblock>
+nx1 = 16
+nx2 = 16
+nx3 = 16
+
+<units>
+mass_cgs = 1.98841586e33
+length_cgs = 1.3914e11
+time_cgs = 1.2709152632111343e3
+mu = 1.0
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.4
+nlim = 0
+tlim = 1.0
+ndiag = 1
+
+<hydro>
+eos = ideal
+gamma = 1.6666666666666667
+reconstruct = plm
+rsolver = hlle
+dfloor = 1.0e-10
+pfloor = 1.0e-12
+dual_energy = true
+dual_energy_eta1 = 1.0e-3
+dual_energy_eta2 = 1.0e-4
+
+<gravity>
+self_gravity = false
+four_pi_G = 1.0
+
+<remap>
+enable = true
+source = rst/TDEGoldenSrc.final.rst
+settle_steps = 0
+settle_passes = 0
+
+<problem>
+pgen_name = tde_external
+user_srcs = true
+
+star_radius = 0.5
+poly_n = 1.5
+stellar_structure_mode = legacy_polytrope
+rho_floor = 1.0e-10
+relax_damp = false
+amp = 0.0
+x_center = 0.0
+y_center = 0.0
+z_center = 0.0
+vx_star = 0.0
+vy_star = 0.0
+vz_star = 0.0
+use_translating_frame = false
+frame_rho_min = 1.0e-9
+bh_grav_rho_min = 1.0e-9
+
+mass_ratio = 1000.0
+beta = 1.0
+ecc_bh = 1.0
+theta_bh = 0.0
+sep_initial = 6.0
+bh_softening = 5.0e-3
+bh_inner_boundary = true
+bh_excise_radius = 0.2
+
+<output1>
+file_type = bin
+variable = hydro_u
+dt = 0.001

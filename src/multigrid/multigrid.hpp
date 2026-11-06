@@ -14,12 +14,13 @@
 #include <cstdint>  // std::int64_t
 #include <cstdio> // std::size_t
 #include <cstring> // memcpy
+#include <algorithm>  // std::max
+#include <array>
 #include <iostream>
 #include <map>
-#include <memory>
-#include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <utility>  // std::make_pair
 #include <vector>
 
 // AthenaK headers
@@ -38,7 +39,7 @@ class Coordinates;
 class MultigridDriver;
 class MultigridBoundaryValues;
 
-enum class MGVariable {src, u, coeff};
+enum class MGVariable {src, u};
 enum class MGNormType {max, l1, l2};
 
 //----------------------------------------------------------------------------------------
@@ -60,40 +61,35 @@ struct LogicalLocationHash {
 };
 
 //----------------------------------------------------------------------------------------
-// Precomputed neighbor info for each of 27 directions (center unused).
-// Indexed by (ox3+1)*9 + (ox2+1)*3 + (ox1+1).
-
-struct OctetNeighborInfo {
-  int same_id;    // same-level neighbor octet ID, or -1 if coarser/absent
-  int coarse_id;  // coarser-level neighbor octet ID, or -1 if from root
-};
-
-//----------------------------------------------------------------------------------------
 //! \class MGOctet
 //  \brief structure containing 2x2x2 interior cells (+ ghost) for mesh refinement
 //  Each octet represents a "parent cell" that has children at a finer level.
-//  Arrays are stored as flat std::vector<Real> with 4D indexing (v, k, j, i).
+//  Arrays are flat with 4D indexing (v, k, j, i).
+//
+//  The four field arrays are NOT owned by the octet.  They point into the single
+//  contiguous pool that InitializeOctets() lays out for the whole refinement level, so
+//  a level of N octets costs one allocation instead of 4N scattered ones, and the
+//  level-wide operations (clear u, copy u into uold) become one bulk call instead of
+//  N.  Within a pool the fields are stored one after the other -- all of u, then all of
+//  def, then src, then uold -- so each of those level-wide runs is contiguous.
 
 class MGOctet {
  public:
   LogicalLocation loc;
   bool fleaf;
-  int nc, nvar;  // nc = 2 + 2*ngh
-  OctetNeighborInfo neighbors[27];
+  int nc;  // nc = 2 + 2*ngh
 
-  // Raw pointers into contiguous per-level buffers managed by MultigridDriver.
-  Real *u, *def, *src, *uold;
+  Real *u = nullptr, *def = nullptr, *src = nullptr, *uold = nullptr;
 
-  void Init(int nv, int ngh) {
+  // Point this octet at slot `o` of a level pool whose per-field run is `stride` Reals.
+  void Attach(Real *pool, std::size_t o, std::size_t stride, int nv, int ngh) {
     nc = 2 + 2*ngh;
-    nvar = nv;
-    u = def = src = uold = nullptr;
+    const std::size_t sz = static_cast<std::size_t>(nv)*nc*nc*nc;
+    u    = pool + o*sz;
+    def  = pool + stride + o*sz;
+    src  = pool + 2*stride + o*sz;
+    uold = pool + 3*stride + o*sz;
   }
-
-  int size() const { return nvar * nc * nc * nc; }
-  void ZeroClearU() { std::memset(u, 0, size() * sizeof(Real)); }
-  void ZeroClearSrc() { std::memset(src, 0, size() * sizeof(Real)); }
-  void StoreOld() { std::memcpy(uold, u, size() * sizeof(Real)); }
 
   inline Real& U(int v, int k, int j, int i) {
     return u[((v*nc + k)*nc + j)*nc + i];
@@ -135,7 +131,6 @@ struct MultigridTaskIDs {
       TaskID recvR;
       TaskID physbR;
       TaskID smoothR;
-      TaskID clearR;
       TaskID sendB;
       TaskID ircvB;
       TaskID recvB;
@@ -153,22 +148,11 @@ struct MultigridTaskIDs {
       TaskID smoothB2;
       TaskID restrict_;
       TaskID prolongate;
+      TaskID prepare_correction;
       TaskID fmg_prolongate;
       TaskID calc_rhs;
-      TaskID apply_mask;
-      TaskID zero_clear;
-      TaskID store_old;
-      TaskID smooth;
       TaskID clear_recv0;
       TaskID clear_send0;
-      TaskID clear_recv1;
-      TaskID clear_send1;
-      TaskID clear_recvR;
-      TaskID clear_sendR;
-      TaskID clear_recvB;
-      TaskID clear_sendB;
-      TaskID clear_recvR2;
-      TaskID clear_sendR2;
       TaskID clear_recvB2;
       TaskID clear_sendB2;
       TaskID fc_ghosts0;
@@ -177,12 +161,6 @@ struct MultigridTaskIDs {
       TaskID fc_ghostsR2;
       TaskID fc_ghostsB2;
       TaskID fc_ghosts_prol;
-      TaskID fill_coarse0;
-      TaskID fill_coarse1;
-      TaskID fill_coarseR;
-      TaskID fill_coarseB;
-      TaskID fill_coarseR2;
-      TaskID fill_coarseB2;
 };
 
 //! \class Multigrid
@@ -194,58 +172,103 @@ class Multigrid {
             bool on_host = false);
   virtual ~Multigrid();
 
-  // KGF: Both btype=BoundaryQuantity::mg and btypef=BoundaryQuantity::mg_faceonly (face
-  // neighbors only) are passed to comm function calls in mg_task_list.cpp Only
-  // BoundaryQuantity::mg is handled in a case in InitBoundaryData(). Passed directly
-  // (not through btype) in MGBoundaryValues() ctor
   MultigridBoundaryValues *pbval = nullptr;
   void ReallocateForAMR();
   void UpdateBlockDx();
   void LoadFinestData(const DvceArray5D<Real> &src, int ns, int ngh);
-  void LoadSource(const DvceArray5D<Real> &src, int ns, int ngh, Real fac);
-  void LoadCoefficients(const DvceArray5D<Real> &coeff, int ngh);
-  void ApplyMask();
+  // src_min/src_floor bracket the continuous coupling weight of
+  // utils/gravity_weight.hpp: the loaded source is w(s)*s, with w ramping from zero at
+  // src_floor to one at src_min.  src_min at or below src_floor leaves w == 1 and the
+  // loaded source untouched.
+  void LoadSource(const DvceArray5D<Real> &src, int ns, int ngh, Real fac,
+                  Real src_min = -1.0, Real src_floor = -1.0);
+  void LoadSourceAndSubtractAverage(const DvceArray5D<Real> &src, int ns, int ngh,
+                                    Real fac, Real src_min = -1.0,
+                                    Real src_floor = -1.0);
   void RetrieveResult(DvceArray5D<Real> &dst, int ns, int ngh);
-  void RetrieveDefect(DvceArray5D<Real> &dst, int ns, int ngh);
   void ZeroClearData();
-  void CopySourceToData();
   void RestrictPack();
   void RestrictSourcePack();
-  void RestrictCoefficients();
   void FMGProlongatePack();
   void ProlongateAndCorrectPack();
+  void ProlongatePreparedCorrectionPack();
   virtual void SmoothPack(int color) = 0;
   virtual void CalculateDefectPack() = 0;
   virtual void CalculateFASRHSPack() = 0;
   void ComputeCorrection();
-  void CalculateMatrixPack(Real dt);
   void SetFromRootGrid(bool folddata);
   Real CalculateDefectNorm(MGNormType nrm, int n);
+  Real CalculateArrayNorm(MGVariable type, MGNormType nrm, int n);
   Real CalculateAverage(MGVariable type);
-  Real CalculateTotal(MGVariable type, int n);
   void SubtractAverage(MGVariable type, int n, Real ave);
   void StoreOldData();
-  Real GetCoarsestData(MGVariable type, int m, int n);
-  void SetData(MGVariable type, int n, int k, int j, int i, Real v);
-  void PrintActiveRegion(const DvceArray5D<Real> &data);
-  void PrintAll(const DvceArray5D<Real> &data);
+
+  // The MeshBlock dimension of the per-block arrays is over-allocated to a whole storage
+  // grain (see mesh/mb_storage.hpp) so that AMR jitter does not reallocate them; nmmb_
+  // stays the LIVE block count and bounds every kernel.  Every accessor below hands out
+  // the live [0, nmmb_) range only, because consumers outside this class size their loops
+  // from extent(0) -- MultigridDriver::ApplyPhysicalBoundariesBlocks does exactly that --
+  // and must never see the padding.
+  template <typename ViewType>
+  auto LiveBlocks(const ViewType &v) const {
+    // Clamped, because uold_ on the finest MeshBlock level is deliberately never
+    // allocated and must keep handing back the empty view it does today.
+    const int nlive = (v.extent_int(0) < nmmb_) ? v.extent_int(0) : nmmb_;
+    return Kokkos::subview(v, std::make_pair(0, nlive), Kokkos::ALL(), Kokkos::ALL(),
+                           Kokkos::ALL(), Kokkos::ALL());
+  }
+
+  void ZeroLevelLiveBlocks(int l, bool has_uold);
 
   // small functions
   int GetCurrentNumberOfCells() { return 1<<current_level_; }
   int GetNumberOfLevels() { return nlevel_; }
   int GetCurrentLevel() { return current_level_; }
+  void SetCurrentLevel(int lev) { current_level_ = lev; }
   int GetLevelShift() { return nlevel_ - 1 - current_level_; }
   int GetSize() { return indcs_.nx1; }
+  // True when every block edge of the current level is even and at least 2 in 2D/3D.  The
+  // red-black colour (i+j+k-ngh)&1 of a cell is then the same number on both sides of a
+  // same-level block face, which is what lets an exchange send one colour only.
+  bool HasEvenColourEdges() {
+    if (indcs_.nx1 < 2 || indcs_.nx2 < 2) return false;
+    const int sh = GetLevelShift();
+    auto even = [sh](int n) {
+      if (n <= 1) return true;
+      const int e = n >> sh;
+      return (e >= 2) && ((e & 1) == 0);
+    };
+    return even(indcs_.nx1) && even(indcs_.nx2) && even(indcs_.nx3);
+  }
   int GetGhostCells() { return ngh_; }
   Real GetRootDx() { return rdx_; }
-  auto GetCurrentData() { return u_[current_level_].d_view; }
-  auto GetCurrentSource() { return src_[current_level_].d_view; }
-  auto GetCurrentOldData() { return uold_[current_level_].d_view; }
-  auto GetCurrentCoefficient() { return coeff_[current_level_].d_view; }
-  auto GetCurrentData_h() { return u_[current_level_].h_view; }
-  auto GetCurrentSource_h() { return src_[current_level_].h_view; }
-  auto GetCurrentOldData_h() { return uold_[current_level_].h_view; }
+  Real GetRootDy() { return rdy_; }
+  Real GetRootDz() { return rdz_; }
+  auto GetCurrentData() { return LiveBlocks(u_[current_level_].d_view); }
+  auto GetCurrentSource() { return LiveBlocks(src_[current_level_].d_view); }
+  auto GetCurrentOldData() { return LiveBlocks(uold_[current_level_].d_view); }
+  auto GetCurrentData_h() { return LiveBlocks(u_[current_level_].h_view); }
+  auto GetCurrentSource_h() { return LiveBlocks(src_[current_level_].h_view); }
+  auto GetCurrentOldData_h() { return LiveBlocks(uold_[current_level_].h_view); }
   bool OnHost() const { return on_host_; }
+  auto GetDataAtLevel(int lev) { return LiveBlocks(u_[lev].d_view); }
+  auto GetSourceAtLevel(int lev) { return LiveBlocks(src_[lev].d_view); }
+  auto GetOldDataAtLevel(int lev) { return LiveBlocks(uold_[lev].d_view); }
+  int GetNumMeshBlocks() const { return nmmb_; }
+  void MarkCurrentDataDeviceModified() { u_[current_level_].template modify<DevExeSpace>(); }
+  void MarkCurrentSourceDeviceModified() {
+    src_[current_level_].template modify<DevExeSpace>();
+  }
+  void MarkCurrentOldDataDeviceModified() {
+    uold_[current_level_].template modify<DevExeSpace>();
+  }
+  void MarkDataAtLevelDeviceModified(int lev) { u_[lev].template modify<DevExeSpace>(); }
+  void MarkOldDataAtLevelDeviceModified(int lev) {
+    uold_[lev].template modify<DevExeSpace>();
+  }
+  void SyncCurrentDataToHost() { u_[current_level_].template sync<HostExeSpace>(); }
+  void SyncCurrentSourceToHost() { src_[current_level_].template sync<HostExeSpace>(); }
+  void SyncCurrentOldDataToHost() { uold_[current_level_].template sync<HostExeSpace>(); }
 
 
   // actual implementations of Multigrid operations (templated on view type)
@@ -261,18 +284,16 @@ class Multigrid {
 
   // Physics-dependent operations templated on view type and stencil.
   // The stencil functor must provide:
-  //   Real Apply(const ViewType&, const ViewType&, int m, int v, int k, int j, int i)
+  //   Real Apply(const ViewType&, int m, int v, int k, int j, int i)
   //   Real omega_over_diag
   template <typename ViewType, typename StencilOp>
-  void Smooth(ViewType &u, const ViewType &src, const ViewType &coeff,
-              const ViewType &matrix, const StencilOp &stencil, int rlev,
-              int il, int iu, int jl, int ju, int kl, int ku, int color, bool th);
+  void Smooth(ViewType &u, const ViewType &src, const StencilOp &stencil, int rlev,
+              int il, int iu, int jl, int ju, int kl, int ku, int color);
 
   template <typename ViewType, typename StencilOp>
   void CalculateDefect(ViewType &def, const ViewType &u, const ViewType &src,
-                       const ViewType &coeff, const ViewType &matrix,
                        const StencilOp &stencil, int rlev,
-                       int il, int iu, int jl, int ju, int kl, int ku, bool th) {
+                       int il, int iu, int jl, int ju, int kl, int ku) {
     using ExeSpace = typename ViewType::execution_space;
     auto brdx = [this]() {
       if constexpr (std::is_same_v<ExeSpace, HostExeSpace>)
@@ -286,14 +307,13 @@ class Multigrid {
       Real dx = (rlev_l <= 0) ? brdx(m) * static_cast<Real>(1<<(-rlev_l))
                               : brdx(m) / static_cast<Real>(1<<rlev_l);
       Real idx2 = 1.0 / (dx * dx);
-      def(m,0,k,j,i) = src(m,0,k,j,i) - stencil.Apply(u, coeff, m, 0, k, j, i) * idx2;
+      def(m,0,k,j,i) = src(m,0,k,j,i) - stencil.Apply(u, m, 0, k, j, i) * idx2;
     });
   }
 
   template <typename ViewType, typename StencilOp>
-  void CalculateFASRHS(ViewType &src, const ViewType &u, const ViewType &coeff,
-                       const ViewType &matrix, const StencilOp &stencil, int rlev,
-                       int il, int iu, int jl, int ju, int kl, int ku, bool th) {
+  void CalculateFASRHS(ViewType &src, const ViewType &u, const StencilOp &stencil,
+                       int rlev, int il, int iu, int jl, int ju, int kl, int ku) {
     using ExeSpace = typename ViewType::execution_space;
     auto brdx = [this]() {
       if constexpr (std::is_same_v<ExeSpace, HostExeSpace>)
@@ -307,7 +327,7 @@ class Multigrid {
       Real dx = (rlev_l <= 0) ? brdx(m) * static_cast<Real>(1<<(-rlev_l))
                               : brdx(m) / static_cast<Real>(1<<rlev_l);
       Real idx2 = 1.0 / (dx * dx);
-      src(m,0,k,j,i) += stencil.Apply(u, coeff, m, 0, k, j, i) * idx2;
+      src(m,0,k,j,i) += stencil.Apply(u, m, 0, k, j, i) * idx2;
     });
   }
 
@@ -319,21 +339,25 @@ class Multigrid {
   MeshBlock *pmy_block_;
   MeshBlockPack *pmy_pack_;
   Mesh *pmy_mesh_;
-  LogicalLocation loc_;
   RegionSize size_;
   RegionIndcs indcs_;
   BoundaryFlag mg_block_bcs_[6];
-  int nlevel_, ngh_, nvar_, ncoeff_, nmatrix_, current_level_;
-  int nmmbx1_, nmmbx2_, nmmbx3_;
-  int nmmb_;
+  int nlevel_, ngh_, nvar_, current_level_;
+  int nmmb_;           // LIVE number of MeshBlocks; the bound of every kernel
+  int nmmb_capacity_;  // block extent actually allocated, >= nmmb_ (mb_storage.hpp)
   bool on_host_;
 
   Real rdx_, rdy_, rdz_;
+  Real dvol_over_dx3_;
   Real defscale_;
   DualArray1D<Real> block_rdx_;
-  DvceArray1D<int> fc_childx_, fc_childy_, fc_childz_;
-  DualArray5D<Real> *u_, *def_, *src_, *uold_, *coeff_, *matrix_;
-  Coordinates *coord_, *ccoord_;
+  DualArray1D<int> block_color_parity_;
+  // Labelled at construction: Kokkos::realloc inherits the label, and a default-built
+  // View reports its allocation failures anonymously.
+  DvceArray1D<int> fc_childx_{"mg_fc_childx", 0};
+  DvceArray1D<int> fc_childy_{"mg_fc_childy", 0};
+  DvceArray1D<int> fc_childz_{"mg_fc_childz", 0};
+  DualArray5D<Real> *u_ = nullptr, *def_ = nullptr, *src_ = nullptr, *uold_ = nullptr;
 };
 
 
@@ -351,58 +375,150 @@ class MultigridDriver {
   // pure virtual function
   virtual void Solve(Driver *pdriver, int step, Real dt = 0.0) = 0;
   void PrepareForAMR();
+  // Clear the sticky AMR flag; see the comment on PrepareForAMR().  Call this only
+  // once a full solve has actually run under the post-refinement policy.
+  void ConsumeAMRMeshChanged() { amr_mesh_changed_ = false; }
+  // The driver as a freshly built one holds it, which is how a restart builds it: the
+  // next PrepareForAMR rebuilds the hierarchy, the next solve is the first after a
+  // hierarchy change, and the solve history a checkpoint does not carry goes -- the
+  // automatic expansion origin (the previous solve's centre of mass, about which the
+  // next solve takes its moments before shifting them: not bit-exact), the measured
+  // V-cycle contraction that sizes the next solve's first burst, the last defect.  A run
+  // that writes a checkpoint calls it (Driver::Execute), with the potential dropped, so
+  // that it continues as its restart does.
+  void MarkHierarchyFresh() {
+    needinit_ = true;
+    if (autompo_) mpo_[0] = mpo_[1] = mpo_[2] = 0.0;
+    last_vcycle_contraction_ = -1.0;
+    last_defect_norm_ = 0.0;
+    last_defect_valid_ = false;
+  }
+  void RefreshMeshblockBoundaryValues(ParameterInput *pin);
   int GetCoffset() const { return coffset_; }
+  bool ActiveReducedSameExchange() const { return active_reduce_same_exchange_; }
   void MGRootBoundary();
+  void AllocateMultipoleCoefficients();
+  void EnsureMultipolePartials();
+  void CalculateMultipoleCoefficients();
+  void ScaleMultipoleCoefficients();
+  void SyncMultipoleToDevice();
+
+  // The multipole potential on the ghost cells of a physical face, evaluated once per
+  // solve per level.  The coefficients and the expansion origin are fixed for a whole
+  // solve, so this field is too, while the boundary kernels that consume it run tens of
+  // times per V-cycle and cost a square root and about a hundred flops per ghost cell
+  // each time.  face_m / face_f is also the compact list of the (block, face) pairs that
+  // actually carry a physical boundary: on a deeply refined mesh most blocks touch none,
+  // and the kernels used to launch over every block and let those threads fall through.
+  struct MGBoundaryPhiCache {
+    DvceArray1D<int> face_m, face_f;
+    // Global cell index of the block's first interior cell, and the cell size at the
+    // block's refinement level, per axis.  The tangential coordinate is built from these
+    // rather than from the block's own extent so that two blocks meeting on a physical
+    // face agree on it bit for bit.
+    DvceArray2D<int> face_base;
+    DvceArray2D<Real> face_dx;
+    DvceArray2D<Real> phi;   // one nx*nx tangential plane per entry
+    int off[7] = {};         // first entry of each face; off[6] is the total
+    int nface = 0;
+    int nx = 0;
+    int nmb = -1;
+    bool has_phi = false;
+    std::uint64_t mesh_sig = 0;
+    std::uint64_t epoch = 0;
+    bool valid = false;
+  };
+  // The root grid is one block spanning the mesh, so its faces need no list -- only the
+  // six planes, whose extents differ when the root is not cubic.
+  struct MGRootPhiCache {
+    HostArray1D<Real> phi_h;
+    DvceArray1D<Real> phi_d;
+    int off[6] = {};
+    int len = 0;
+    bool on_host = false;
+    std::uint64_t epoch = 0;
+    bool valid = false;
+  };
+  const MGBoundaryPhiCache &EnsureBoundaryPhiCache(int shift, int ngh, int ncells,
+       int nx1_cells, int nx2_cells, int nx3_cells);
+  // on_host has to come from the caller rather than from mgroot_->on_host_, so that the
+  // plane is filled on the space the sweep that reads it will run on.
+  const MGRootPhiCache &EnsureRootPhiCache(int ll, bool on_host, int nx, int ny, int nz,
+       int ngh, Real dx1, Real dx2, Real dx3);
   void TransferFromBlocksToRoot(bool initflag);
   void TransferFromRootToBlocks(bool folddata);
+  void TransferFromRootToBlocksDistributed(bool folddata);
+  std::uint64_t GetMeshSignature() const { return mesh_sig_; }
+  // Whether the block levels have fine/coarse boundaries, i.e. whether every same-level
+  // refresh is followed by a fine/coarse fill.
+  bool HasRefinedLevels() const { return nreflevel_ > 0; }
+  // Two initial iterates for the next iterative solve: `primary` is already loaded on the
+  // finest level; `alternative` (nullptr: none) replaces it if its defect is smaller.
+  // Consumed by the solve.
+  void SetWarmStartCandidates(const DvceArray5D<Real> *primary,
+                              const DvceArray5D<Real> *alternative, int ngh) {
+    warm_primary_ = primary; warm_alternative_ = alternative; warm_ngh_ = ngh;
+  }
+  // Coarse/fine face ghost fill on the MeshBlock levels: keep (true, the historical
+  // scheme) or drop (false) the tangential-gradient terms of the coarse value that the
+  // fine-side ghost sees.  The terms are not reciprocated by the coarse cell's equation,
+  // so they make the composite operator non-symmetric; dropping them gives a
+  // flux-matched, symmetric interface at the price of piecewise-constant tangential
+  // interpolation.  Set from <gravity>/mg_fc_symmetric in MGGravityDriver.
+  bool FCTangentialGradient() const { return fc_tangential_gradient_; }
+  bool fc_tangential_gradient_ = true;
 
-  // per-cell octet operations (Athena++ style)
+  // per-cell octet operations
   void InitializeOctets();
   void SmoothOctets(int color);
   void RestrictOctets();
   void ProlongateAndCorrectOctets();
   void FMGProlongateOctets();
   void SetBoundariesOctets(bool fprolong, bool folddata);
-  void ProlongateOctetBoundaries(MGOctet &oct,
+  void ApplyPhysicalBoundariesOctet(MGOctet &oct, bool folddata);
+  void ComputeOctetInteriorAverages(int lev, bool folddata);
+  void SetOctetCoarseBufferPhysicalBoundaries(const MGOctet &oct, int oct_id,
+       std::vector<Real> &cbuf, std::vector<Real> &cbufold, bool folddata);
+  // homogeneous=true when the array holds a CORRECTION rather than the solution: the
+  // correction must satisfy the homogeneous form of every boundary condition, so an
+  // inhomogeneous Dirichlet value (the multipole potential) must not be injected.
+  void ApplyPhysicalBoundariesBlocks(bool fill_tangential_ghosts = false,
+                                     bool homogeneous = false);
+  void ProlongateOctetBoundariesFluxCons(MGOctet &oct,
+       std::vector<Real> &cbuf, int nvar, const std::array<bool,27> &ncoarse);
+  void ProlongateOctetBoundaries(MGOctet &oct, int oct_id,
        std::vector<Real> &cbuf, std::vector<Real> &cbufold,
-       int nvar, const std::vector<bool> &ncoarse, bool folddata);
+       int nvar, const std::array<bool,27> &ncoarse, bool folddata);
   void StoreOldDataOctets();
   void CalculateFASRHSOctets();
   void ZeroClearOctets();
   void RestrictFMGSourceOctets();
-  void PreRestrictOctetU();
   void RestrictOctetsBeforeTransfer();
   void SetOctetBoundariesBeforeTransfer(bool folddata);
-  void SetOctetBoundarySameLevel(MGOctet &dst, const MGOctet &src,
+  void SetOctetBoundarySameLevel(MGOctet &dst, const MGOctet &src, int src_id,
        std::vector<Real> &cbuf, std::vector<Real> &cbufold,
        int nvar, int ox1, int ox2, int ox3, bool folddata);
-  void SetOctetBoundaryFromCoarser(const Real *un,
-       const Real *unold,
+  void SetOctetBoundaryFromCoarser(const Real *un, const Real *unold,
        std::vector<Real> &cbuf, std::vector<Real> &cbufold,
-       int nvar, int un_nc, const LogicalLocation &loc,
+       int nvar, int un_nx, int un_ny, int un_nz, const LogicalLocation &loc,
        int ox1, int ox2, int ox3, bool folddata);
-  void ApplyPhysicalBoundariesOctet(MGOctet &oct, bool fcbuf);
 
-  // physics-dependent octet operations (virtual, overridden in derived drivers)
-  virtual void SmoothOctet(MGOctet &oct, int rlev, int color) = 0;
-  virtual void CalculateDefectOctet(MGOctet &oct, int rlev) = 0;
-  virtual void CalculateFASRHSOctet(MGOctet &oct, int rlev) = 0;
-  virtual void ProlongateOctetBoundariesFluxCons(MGOctet &oct,
-       std::vector<Real> &cbuf, const std::vector<bool> &ncoarse);
+  // Physics-dependent octet operations (virtual, overridden in derived drivers).  The
+  // loop over the level's octets lives inside the override, so a level costs one
+  // virtual dispatch rather than one per octet -- and the grid spacing and stencil
+  // weights, which are the same for every octet of a level, are computed once.
+  virtual void SmoothOctetLevel(MGOctet *octs, int noct, int rlev, int color) = 0;
+  virtual void CalculateDefectOctetLevel(MGOctet *octs, int noct, int rlev) = 0;
+  virtual void CalculateFASRHSOctetLevel(MGOctet *octs, int noct, int rlev) = 0;
+  virtual bool SupportsDistributedCoarseSync() const { return false; }
+  virtual void SyncDistributedCoarseSolution(bool folddata) {}
 
   DualArray2D<Real> rootbuf_;
-
-  TaskStatus PhysicalBoundary(Driver *pdrive, int stag);
-
-  void AllocateMultipoleCoefficients();
-  void CalculateMultipoleCoefficients();
-  void ScaleMultipoleCoefficients();
-  void CalculateCenterOfMass();
+  DualArray2D<Real> rootsrcbuf_;
 
   friend class Multigrid;
 
  protected:
-  void CheckBoundaryFunctions();
   void SubtractAverage(MGVariable type);
   void SetupMultigrid(Real dt, bool ftrivial);
   void FMGProlongate(Driver *pdriver);
@@ -413,54 +529,73 @@ class MultigridDriver {
   void SolveMG(Driver *pdriver);
   void SolveFMGCoarser();
   void SolveIterative(Driver *pdriver);
+  void RefreshFinestHalo();
   void SolveIterativeFixedTimes(Driver *pdriver);
-  void AssembleTasks(std::map<std::string, std::shared_ptr<TaskList>> tl);
+  void ResetSolveCounters();
   TaskStatus SendBoundary(Driver *pdrive, int stag);
   TaskStatus RecvBoundary(Driver *pdrive, int stag);
   TaskStatus StartReceive(Driver *pdrive, int stag);
-  TaskStatus StartReceiveFluxCons(Driver *pdrive, int stag);
-  TaskStatus StartReceiveForProlongation(Driver *pdrive, int stag);
-  TaskStatus ClearBoundary(Driver *pdrive, int stag);
-  TaskStatus ClearBoundaryFluxCons(Driver *pdrive, int stag);
-  TaskStatus SendBoundaryFluxCons(Driver *pdrive, int stag);
   TaskStatus SendBoundaryForProlongation(Driver *pdrive, int stag);
-  TaskStatus ReceiveBoundaryFluxCons(Driver *pdrive, int stag);
-  TaskStatus ReceiveBoundaryForProlongation(Driver *pdrive, int stag);
+  TaskStatus RecvBoundaryForProlongation(Driver *pdrive, int stag);
+  TaskStatus StartReceiveForProlongation(Driver *pdrive, int stag);
   TaskStatus SmoothRed(Driver *pdrive, int stag);
   TaskStatus SmoothBlack(Driver *pdrive, int stag);
-  TaskStatus Smooth(Driver *pdrive, int stag);
+  TaskStatus PhysicalBoundary(Driver *pdrive, int stag);
+  TaskStatus PhysicalBoundaryForProlongation(Driver *pdrive, int stag);
+  // Same, but for the up-leg where the array holds a CORRECTION and every boundary
+  // condition must be applied in its homogeneous form.
+  TaskStatus PhysicalBoundaryForCorrectionProlongation(Driver *pdrive, int stage);
   TaskStatus Restrict(Driver *pdrive, int stag);
   TaskStatus Prolongate(Driver *pdrive, int stag);
+  TaskStatus PrepareCorrection(Driver *pdrive, int stag);
+  TaskStatus ProlongatePreparedCorrection(Driver *pdrive, int stag);
   TaskStatus FMGProlongateTask(Driver *pdrive, int stag);
-  TaskStatus ProlongateBoundary(Driver *pdrive, int stag);
-  TaskStatus ProlongateBoundaryForProlongation(Driver *pdrive, int stag);
   TaskStatus FillFCBoundary(Driver *pdrive, int stag);
-  TaskStatus FillCoarseBoundary(Driver *pdrive, int stag);
-  TaskStatus ProlongateFCBoundary(Driver *pdrive, int stag);
+  TaskStatus FillFCBoundaryForProlongation(Driver *pdrive, int stag);
+  bool MGBoundaryOverridesPeriodicMesh() const;
   TaskStatus CalculateFASRHS(Driver *pdrive, int stag);
-  TaskStatus StoreOldData(Driver *pdrive, int stag);
   TaskStatus ClearRecv(Driver *pdrive, int stag);
   TaskStatus ClearSend(Driver *pdrive, int stag);
-  void SetMGTaskListToFiner(int nsmooth, int ngh, int flag=0);
-  void SetMGTaskListFMGProlongate(int ngh, int flag = 0);
-  void SetMGTaskListToCoarser(int nsmooth, int ngh);
-  void DoTaskListOneStage();
+  void SetMGTaskListToFiner(int nsmooth, int ngh, int flag=0,
+                           bool reduce_same_exchange=false);
+  void SetMGTaskListFMGProlongate(int ngh);
+  void SetMGTaskListToCoarser(int nsmooth, int ngh,
+                              bool reduce_same_exchange=false);
+  bool UseReducedSameExchangeOnCurrentLevel(bool to_finer, int flag=0) const;
+  bool UseExactHaloPair(int nsmooth, int level_shift) const;
+  bool UseDistributedCoarseSolve() const {
+    return distributed_coarse_solve_ && nranks_ > 1;
+  }
+  bool IsCoarseSolveOwner() const {
+    return (!UseDistributedCoarseSolve() ||
+            global_variable::my_rank == coarse_owner_rank_);
+  }
 
   virtual void SolveCoarsestGrid();
   Real CalculateDefectNorm(MGNormType nrm, int n);
-  void CalculateMatrix(Real dt);
-  Multigrid* FindMultigrid(int tgid);
+  Real CalculateArrayNorm(MGVariable type, MGNormType nrm, int n);
   // container to hold names of TaskIDs
   MultigridTaskIDs id;
 
   // small functions
   int GetNumMultigrids() { return nblist_[global_variable::my_rank]; }
 
-  int nranks_, nthreads_, nbtotal_, nvar_, ncoeff_, nmatrix_, mode_;
+  int nranks_, nbtotal_, nvar_;
   int locrootlevel_, nrootlevel_, nmblevel_, ntotallevel_, nreflevel_, maxreflevel_;
   int current_level_, fmglevel_;
-  int *nslist_, *nblist_, *nvlist_, *nvslist_, *nvlisti_, *nvslisti_,
-                          *nclist_, *ncslist_, *ranklist_;
+  bool finest_bvals_fresh_;
+  bool skip_coarser_initial_exchange_once_;
+  bool active_reduce_same_exchange_;
+  bool mg_tl_to_finer_valid_;
+  bool mg_tl_to_coarser_valid_;
+  bool mg_tl_fmg_prolongate_valid_;
+  int mg_tl_to_finer_nsmooth_;
+  int mg_tl_to_finer_flag_;
+  bool mg_tl_to_finer_reduce_same_;
+  int mg_tl_to_coarser_nsmooth_;
+  bool mg_tl_to_coarser_skip_initial_;
+  bool mg_tl_to_coarser_reduce_same_;
+  int *nslist_, *nblist_, *nvlist_, *nvslist_, *nvlisti_, *nvslisti_, *ranklist_;
   int nrbx1_, nrbx2_, nrbx3_;
   BoundaryFlag mg_mesh_bcs_[6];
   Mesh *pmy_mesh_;
@@ -468,161 +603,503 @@ class MultigridDriver {
   Multigrid *mgroot_;
   Multigrid *mglevels_;
   Multigrid *pmg;
-  bool fsubtract_average_, needinit_;
-  int amr_seq_;  // tracks cumulative AMR events to detect mesh changes
-  Real last_ave_;
+  bool fsubtract_average_, needinit_, amr_mesh_changed_;
+  std::uint64_t mesh_sig_;
+  std::uint64_t mesh_topology_version_;
   Real eps_;
+  Real last_defect_norm_;
+  bool last_defect_valid_;
+  //! Mesh cycle of the last "solve ended far from target" warning, so a run that
+  //! never converges says so without printing on every stage of every cycle.
+  int unconverged_warn_cycle_;
+  //! Set by the first threshold > 0 solve that stops on its convergence floor; later
+  //! stops are reported only with show_defect.
+  bool floor_warned_ = false;
   int niter_, npresmooth_, npostsmooth_;
-  int os_, oe_;
   int coffset_;
+  int finest_exact_polish_passes_;
+  int same_exchange_stride_;
+  int local_sweeps_per_exchange_;
+  int reduced_exchange_max_edge_;
   int fprolongation_;
   int fshowdef_;
-  int mg_verbose_;
-
+  int mg_verbose_ = 0;
   bool full_multigrid_;
   int fmg_ncycle_;
+  int defect_check_interval_;
+  // Geometric-mean defect reduction per V-cycle of the last iterative solve (-1: none).
+  // The next solve sizes its first defect-check burst from it.
+  Real last_vcycle_contraction_ = -1.0;
+  const DvceArray5D<Real> *warm_primary_ = nullptr, *warm_alternative_ = nullptr;
+  int warm_ngh_ = 0;
+  // Dimensionless convergence floor for the threshold == 0 policy.  The defect carries
+  // the units of the source, so a floor only means the same thing on two different
+  // problems if it is expressed as a fraction of the source norm.
+  Real auto_target_rtol_;
+  Real source_norm_;
+  // The stopping target of the threshold == 0 policy: a fraction of the source norm,
+  // floored so that a source-free problem still has a finite target to reach.
+  Real AutoTargetDefect() const {
+    return std::max(auto_target_rtol_ * source_norm_, static_cast<Real>(1.0e-12));
+  }
+  int auto_max_extra_cycles_;
+  int coarsest_min_sweeps_;
+  int timing_vcycles_;
+  int timing_coarsest_solves_;
+  int timing_defect_norms_;
+  bool collect_phase_timing_;
+  double timing_to_coarser_time_;
+  double timing_to_finer_time_;
+  double timing_coarsest_time_;
+  double timing_fmg_coarser_time_;
+  double timing_fmg_prolongate_time_;
+  double timing_transfer_blocks_root_time_;
+  double timing_transfer_root_blocks_time_;
+  // The octet regime is host-serial work nested inside to_coarser/to_finer and inside
+  // the transfers, so it is invisible in the phase breakdown without an accumulator of
+  // its own.  It is not fenced: the work is host-side, and the few root-grid copies it
+  // enqueues on the way out are asynchronous, so a fence would only charge it with
+  // whatever the meshblock levels left running.
+  double timing_octets_time_;
+  bool finest_source_average_subtracted_;
+  bool distributed_coarse_solve_;
+  int coarse_owner_rank_;
 
-  // Source masking (zero source outside mask_radius_)
-  Real mask_radius_;
-  Real mask_origin_[3];
+  // Isolated-boundary multipole expansion (up to hexadecapole order).
+  int mporder_ = -1;
+  int nmpcoeff_ = 0;
+  Real mpcoeff_[25] = {};
+  DvceArray1D<Real> d_mpcoeff_;
+  // Scratch for the two per-block partial sums and for the staging of mpcoeff_ on its
+  // way to the device.  These are members rather than locals because both reductions and
+  // the push run on every solve, and a fresh Kokkos::View there means a device malloc and
+  // a device free per solve; a free in particular synchronizes the whole device.
+  HostArray1D<Real> h_mpcoeff_;
+  DvceArray2D<Real> mp_partial_;
+  HostArray2D<Real> mp_partial_h_;
+  // One row of coefficients per (block, x3 slice), so the cell loop can be spread over
+  // nmb*nx3 threads instead of nmb.  The per-slice sums are folded into mp_partial_ by a
+  // second, tiny kernel.
+  DvceArray3D<Real> mp_kpartial_;
+  HostArray3D<Real> mp_kpartial_h_;
+  Real mpo_[3] = {};
+  bool autompo_ = false;
+  bool nodipole_ = false;
+  // Bumped whenever the coefficients or the expansion origin reach the device, which is
+  // once per solve.  Everything downstream of them is constant in between.
+  std::uint64_t mp_epoch_ = 0;
 
-  // Multipole expansion boundary conditions
-  int mporder_;     // -1: disabled, 0: detected but not yet configured, 2 or 4: active
-  int nmpcoeff_;    // number of multipole coefficients
-  Real mpcoeff_[25]; // multipole coefficients (max 25 for l=4)
-  DvceArray1D<Real> d_mpcoeff_; // device copy of multipole coefficients
-  Real mpo_[3];     // multipole expansion origin
-  bool autompo_;    // automatically compute center of mass as origin
-  bool nodipole_;   // suppress dipole moment (assume origin = center of mass)
-  void SyncMultipoleToDevice();
+  // Multipole potential on the domain faces of the octets, keyed by (kind, level, octet,
+  // face) and valid for one coefficient epoch and one mesh.
+  std::vector<Real> &OctetPhiSlot(int kind, int lev, const MGOctet &oct, int face,
+                                  std::size_t n, bool &fresh);
+  const Real *OctetGhostFacePhi(const MGOctet &oct, int face);
+  const Real *OctetBufferFacePhi(const MGOctet &oct, int face);
+  std::map<std::array<int, 6>, std::vector<Real>> octet_phi_;
+  std::uint64_t octet_phi_epoch_ = ~static_cast<std::uint64_t>(0);
+  std::uint64_t octet_phi_sig_ = ~static_cast<std::uint64_t>(0);
 
-  // per-cell octets (Athena++ style)
+  std::vector<MGBoundaryPhiCache> mgbc_phi_;
+  std::vector<MGRootPhiCache> mgroot_phi_;
+
+  // per-cell octets
   std::vector<MGOctet> *octets_;
+  std::vector<Real> *octet_pool_;  // one contiguous backing store per level
+  std::size_t *octet_pool_stride_;  // Reals per field run in that level's pool
   std::unordered_map<LogicalLocation, int, LogicalLocationHash> *octetmap_;
   std::vector<bool> *octetbflag_;
+  std::vector<int> *octet_nb_same_;
+  std::vector<int> *octet_nb_coarse_;
+  std::vector<LogicalLocation> *octet_nb_rootloc_;
+  std::vector<int> *octet_parent_;
+  std::vector<int> *octet_child_i_;
+  std::vector<int> *octet_child_j_;
+  std::vector<int> *octet_child_k_;
+  std::vector<int> *octet_local_ids_;
   int *noctets_;
+  std::vector<int> octet_root_i_, octet_root_j_, octet_root_k_;
+  std::vector<int> mb_octet_lev_, mb_octet_oid_, mb_octet_i_, mb_octet_j_, mb_octet_k_;
   std::vector<Real> cbuf_, cbufold_;  // scratch buffers for boundary exchange
-  std::vector<bool> ncoarse_;         // 3x3x3 flags for coarser neighbors
-
-  // Contiguous per-level buffers backing MGOctet raw pointers.
-  // Layout: octet_stride_ consecutive Reals per octet (nvar*nc*nc*nc).
-  std::vector<Real> *oct_u_buf_, *oct_def_buf_, *oct_src_buf_, *oct_uold_buf_;
-  int octet_stride_;  // elements per octet = nvar * nc^3
+  std::array<bool,27> ncoarse_;       // 3x3x3 flags for coarser neighbors
+  // Volume average of the eight interior cells of each octet of one level, indexed
+  // o*nvar_ + v.  A boundary pass writes only ghosts and off-centre coarse-buffer slots,
+  // so an octet's interior -- and therefore its average -- is fixed for the whole pass.
+  std::vector<Real> octet_avg_, octet_avgold_;
 
   std::vector<Real> root_u_buf_, root_uold_buf_;
-  int root_buf_nc_;
+  // The flat root buffers are a byte copy of the host root view, so they carry its three
+  // extents rather than one cube edge.  A root grid is one cell per root-level MeshBlock
+  // and need not be cubic.
+  int root_buf_nx_, root_buf_ny_, root_buf_nz_;
   bool root_flat_buf_stale_;
-  void BuildRootFlatBuffers();
+  bool root_uold_buf_valid_;
+  // Set for the span of a root->block transfer, during which the host copy of the root
+  // arrays is the only one being written and read.  SyncRootDataToHost() then has
+  // nothing to fetch, and pulling anyway would overwrite the octet restriction the
+  // host has just done -- which is why the old code had to push to the device first.
+  bool root_host_authoritative_;
+  std::vector<Real> coarse_scatter_send_buf_, coarse_scatter_recv_buf_;
+  std::vector<int> coarse_scatter_counts_, coarse_scatter_displs_;
+  std::uint64_t coarse_scatter_mesh_sig_;
+  int coarse_scatter_block_count_;
+  bool coarse_scatter_folddata_;
+  void BuildRootFlatBuffers(bool include_old);
+  void RefreshRootFlatBuffersFromHost();
+  void SyncRootDataToHost(bool include_old);
+  void SyncRootDataToDevice();
+  void SyncRootOldDataToDevice();
+  void SyncRootSourceToDevice();
   void SyncRootToHost();
   void SyncRootToDevice();
-
-  enum class RootSyncState { SYNCED, HOST_MODIFIED, DEVICE_MODIFIED };
-  RootSyncState root_sync_state_;
-  void MarkRootDeviceModified();
 
  private:
   int nb_rank_;
 };
 
-struct MGPerLevelIndcs {
-  MeshBufferIndcs isame, icoar, ifine;
-  int isame_ndat, icoar_ndat, ifine_ndat;
-};
-
 class MultigridBoundaryValues : public MeshBoundaryValuesCC {
  public:
-  static constexpr int kMaxMGLevels = 20;
-
-  MultigridBoundaryValues(MeshBlockPack *pmbp, ParameterInput *pin,
-                          bool coarse, Multigrid *pmg);
+  MultigridBoundaryValues(MeshBlockPack *pmbp, ParameterInput *pin, bool coarse,
+      Multigrid *pmg);
   ~MultigridBoundaryValues();
 
   void RemapIndicesForMG();
-  void ComputePerLevelIndices();
+  void RefreshForNewTopology();
 
   // pack/restrict fluxes at fine/coarse boundaries into boundary buffers and send
-  TaskStatus PackAndSendMG(const DvceArray5D<Real> &u);
-  TaskStatus RecvAndUnpackMG(DvceArray5D<Real> &u);
-  TaskStatus InitRecvMG(const int nvars);
-  TaskStatus ClearSendMG();
+  TaskStatus PackAndSendMG(const DvceArray5D<Real> &u, bool include_diagonals = false);
+  TaskStatus RecvAndUnpackMG(DvceArray5D<Real> &u, bool include_diagonals = false);
+  TaskStatus InitRecvMG(const int nvars, bool include_diagonals = false);
+  TaskStatus FillFineCoarseMGGhosts(DvceArray5D<Real> &u,
+                                    bool include_diagonals = false);
   TaskStatus ClearRecvMG();
-  TaskStatus FillFineCoarseMGGhosts(DvceArray5D<Real> &u);
-
-  // New FC communication via pack/send/recv/unpack infrastructure
-  void FillCoarseMG(const DvceArray5D<Real> &u);
-  TaskStatus ProlongateFCMG(DvceArray5D<Real> &u);
-
-  DvceArray5D<Real> coarse_buf_;
-
-  MGPerLevelIndcs send_mg_indcs_[56][kMaxMGLevels];
-  MGPerLevelIndcs recv_mg_indcs_[56][kMaxMGLevels];
+  TaskStatus ClearSendMG();
+  // A 7-point sweep reads one ghost layer, so the same-level exchange normally carries
+  // exactly one.  The exact communication-avoiding pair sweeps one layer into the halo
+  // and reads two, and asks for the deeper exchange for the calls that feed it.
+  void SetMGSameHaloDepth(int depth) {
+    const int ngh = pmy_mg->GetGhostCells();
+    mg_same_halo_depth_ = (depth < 1) ? 1 : ((depth > ngh) ? ngh : depth);
+  }
+  // After one red-black colour sweep only the cells of that colour differ from the copy
+  // the neighbour holds, so the next face-only same-level exchange may send just those.
+  // `active_colour` is the absolute colour (i+j+k-ngh)&1 of the swept cells, -1 sends
+  // the whole face.  The driver sets it before InitRecvMG of a round and resets it to -1
+  // after RecvAndUnpackMG, as with SetMGSameHaloDepth.  A level that cannot honour it
+  // (see MGSameColourActive) silently sends the whole face, which is always correct.
+  void SetMGSameColourOnly(int active_colour) { mg_same_colour_ = active_colour; }
+#if MPI_PARALLEL_ENABLED
+  void WaitMGSameLevelSendRequests();
+  void WaitMGSameLevelRecvRequests();
+  void FreeMGSameLevelPersistentRequests();
+  void FreeFCRemotePersistentRequests();
+#endif
 
  private:
-  Multigrid *pmy_mg;
-  std::vector<RankPackedVarEntry> mg_send_var_entries_;
-  std::vector<RankPackedVarEntry> mg_recv_var_entries_;
-  std::vector<RankPackedVarMessage> mg_send_var_msgs_;
-  std::vector<RankPackedVarMessage> mg_recv_var_msgs_;
-#if MPI_PARALLEL_ENABLED
-  std::vector<MPI_Request> mg_send_var_reqs_;
-  std::vector<MPI_Request> mg_recv_var_reqs_;
-  std::vector<MPI_Request> mg_send_var_hdr_reqs_;
-  std::vector<MPI_Request> mg_recv_var_hdr_reqs_;
-#endif
-  DvceArray1D<Real> mg_rank_sendbuf_vars_;
-  DvceArray1D<Real> mg_rank_recvbuf_vars_;
-  DvceArray1D<int> mg_rank_sendhdr_vars_;
-  DvceArray1D<int> mg_rank_recvhdr_vars_;
-  // Per-(MeshBlock,neighbour) base offsets into the rank-packed aggregate
-  // buffers, dimensioned (nmb*nnghbr). For off-rank neighbours these hold the
-  // entry's offset in mg_rank_{send,recv}buf_vars_; on-rank/non-existent/skipped
-  // entries are -1. Built in BuildRankPackedMGMetadata so PackMG/UnpackMG can
-  // read/write the aggregate buffer directly (fusing the former MGRankPackAgg /
-  // MGRankUnpackScatter kernels). Send/recv entries are sorted so both ranks of
-  // a pair agree on payload order with no header exchange (recv (m,n) == send
-  // (lid,dn) for the same face exchange).
-  DvceArray1D<int> mg_send_agg_offset_;
-  DvceArray1D<int> mg_recv_agg_offset_;
-  // Device-resident mirrors of the entry tables, used by fused pack/unpack kernels
-  // to avoid issuing one Kokkos::deep_copy per entry. Rebuilt alongside the buffer
-  // allocations in BuildRankPackedMGMetadata.
-  DvceArray1D<RankPackedVarEntry> mg_send_var_entries_d_;
-  DvceArray1D<RankPackedVarEntry> mg_recv_var_entries_d_;
-  int mg_rankpack_level_cache_ = -1;
-  int mg_rankpack_nvars_cache_ = -1;
-  bool mg_rankpack_skipfc_cache_ = false;
-  int mg_rankpack_mesh_seq_cache_ = -1;
-
-#if MPI_PARALLEL_ENABLED
-  void BuildRankPackedMGMetadata(const int nvars, const int lev, const bool skip_fc);
-  // Per-level cache of rank-packed comm state. The single-slot cache (the
-  // mg_rankpack_*_cache_ ints above) rebuilt metadata on every MG level
-  // transition (~85x/cycle at 1 mb/GPU), each rebuild doing several device
-  // allocations + H2D deep_copies that dominate when the payload is tiny. This
-  // caches each level's state, built once and persisted across the many level
-  // revisits in a V-cycle via write-back on level switch.
-  struct MGRankPackLevelState {
-    bool built = false;
-    int nvars = -1;
-    bool skip_fc = false;
-    std::vector<RankPackedVarMessage> send_msgs, recv_msgs;
-    std::vector<MPI_Request> send_reqs, recv_reqs;
-    DvceArray1D<Real> sendbuf, recvbuf;
-    DvceArray1D<int> send_off, recv_off;
+  struct MGSameEntry {
+    int rank;
+    int m;
+    int n;
+    int tag;
+    int size;
   };
-  std::vector<MGRankPackLevelState> mg_rp_cache_;
-  int mg_rp_cache_seq_ = -1;     // mesh_seq the cache was built for (AMR invalidation)
-  int mg_rp_active_level_ = -1;  // level whose state currently lives in the bare members
-  void SaveRankPackState(MGRankPackLevelState &s);
-  void LoadRankPackState(const MGRankPackLevelState &s);
+  // Receive storages whose device consumer is tracked on its own: the two aggregated
+  // same-level payload slots, indexed by the slot number, and the fine/coarse shell.
+  enum MGRecvStore {kMGFCShell = 2, kMGNumRecvStores = 3};
+#if MPI_PARALLEL_ENABLED
+  // Owns one level/mode's aggregate metadata, payload storage, and persistent requests.
+  // States are moved, never copied, so every MPI_Request has exactly one owner.
+  struct MGSameLevelAggState {
+    bool valid = false;
+    int nvars = -1;
+    DvceArray1D<int> send_m_d, send_off_d, send_off_half_d;
+    DvceArray1D<int> recv_m_d, recv_off_d, recv_off_half_d;
+    DvceArray2D<int> send_bounds_d, recv_bounds_d;
+    std::array<DvceArray1D<Real>, 2> send_data_d;
+    std::array<DvceArray1D<Real>, 2> recv_data_d;
+    std::vector<int> send_rank_h, send_data_off_h, send_tag_h;
+    std::vector<int> recv_rank_h, recv_data_off_h, recv_tag_h;
+    std::array<std::vector<MPI_Request>, 2> send_req_h;
+    // The same sends with half the count, for a colour round; empty unless colour_ok.
+    std::array<std::vector<MPI_Request>, 2> send_req_half_h;
+    std::array<std::vector<MPI_Request>, 2> recv_req_h;
+    // Which of the two sets the last send started in each slot belongs to.
+    std::array<bool, 2> send_slot_half{false, false};
+    // This level and mode can exchange one colour (see BuildMGSameLevelAggCache).
+    bool colour_ok = false;
+    std::array<bool, 2> send_slot_inflight{false, false};
+    bool send_inflight = false;
+    bool recv_inflight = false;
+    bool persistent_ready = false;
+    bool has_remote = false;
+    int send_poll_count = 0;
+    int recv_poll_count = 0;
+    int send_pack_slot = 0;
+    int recv_post_slot = 0;
+    int recv_data_slot = 0;
+
+    MGSameLevelAggState() = default;
+    MGSameLevelAggState(const MGSameLevelAggState &) = delete;
+    MGSameLevelAggState &operator=(const MGSameLevelAggState &) = delete;
+    MGSameLevelAggState(MGSameLevelAggState &&) = default;
+    MGSameLevelAggState &operator=(MGSameLevelAggState &&) = default;
+  };
 #endif
+  // Compact-shell index maps for the remote fine/coarse exchange.  These are a pure
+  // function of (ngh, ncells, axis_mask, diagonals), i.e. of the multigrid level shift
+  // and of the exchange mode, and carry no topology information, so one map is cached
+  // per shift and mode.  Rebuilding them costs an O(ni_tot^3) host loop, which must not
+  // run on every V-cycle level change.
+  struct FCRemoteCompactMap {
+    DvceArray1D<int> cmp2full_d;
+    DvceArray1D<int> full2cmp_d;
+    bool valid = false;
+    int ngh = -1;
+    int ncells = -1;
+    int ni_tot = -1;
+    int nj_tot = -1;
+    int nk_tot = -1;
+    int axis_mask = -1;
+    int cell_count = 0;
+  };
+  // Topology of the remote fine/coarse exchange in one mode.  Mode 0 serves the face
+  // neighbours alone; mode 1 serves faces, edges and corners and is used by the fills
+  // that include diagonals.  Everything here is a function of the MeshBlock tree and of
+  // the mode, not of the multigrid level, so it is rebuilt only when the mesh changes.
+  struct FCRemoteTopology {
+    bool cache_valid = false;
+    std::uint64_t mesh_sig = 0;
+    // (MeshBlock, receiver rank) entries this rank sends, and remote blocks it receives,
+    // both sorted by (rank, gid) so that each peer owns one contiguous run.
+    std::vector<int> recv_gid_h, recv_rank_h;
+    std::vector<int> send_gid_h, send_rank_h;
+    std::vector<int> recv_rank_list_h, recv_rank_off_h;
+    std::vector<int> send_rank_list_h, send_rank_off_h;
+    // local MeshBlock of every send entry, and the receive entry of every neighbour slot
+    DvceArray1D<int> send_m_d;
+    DvceArray2D<int> ridx_d;
+    // axes along which this mode has an off-rank fine/coarse neighbour anywhere
+    bool axis_mask_valid = false;
+    std::uint64_t axis_mask_mesh_sig = 0;
+    int axis_mask_nnghbr = -1;
+    int axis_mask = -1;
+  };
+#if MPI_PARALLEL_ENABLED
+  // One persistent MPI request set per multigrid level shift and exchange mode, indexed
+  // by 2*shift + mode.  Each set records the
+  // buffer base pointers, the rank grouping (rbeg/rcount) and the block size it was
+  // built from.  If ANY of those change the set must be freed and rebuilt before it is
+  // started again: a persistent request left bound to a stale device pointer does not
+  // fault, it silently corrupts memory.  States are moved, never copied, so every
+  // MPI_Request has exactly one owner.
+  struct FCRemotePersistentSet {
+    bool ready = false;
+    const Real *recv_base = nullptr;
+    std::array<const Real *, 2> send_base{{nullptr, nullptr}};
+    int block_size = -1;
+    std::vector<int> recv_rank_list_h, recv_rank_off_h;
+    std::vector<int> send_rank_list_h, send_rank_off_h;
+    std::vector<MPI_Request> recv_req_h;
+    std::array<std::vector<MPI_Request>, 2> send_req_h;
+
+    FCRemotePersistentSet() = default;
+    FCRemotePersistentSet(const FCRemotePersistentSet &) = delete;
+    FCRemotePersistentSet &operator=(const FCRemotePersistentSet &) = delete;
+    FCRemotePersistentSet(FCRemotePersistentSet &&) = default;
+    FCRemotePersistentSet &operator=(FCRemotePersistentSet &&) = default;
+  };
+#endif
+ public:
+  // The parts of a fine/coarse round are public only because their kernels are extended
+  // lambdas, which CUDA refuses inside a private or protected member.
+  // One fine/coarse refresh is a round of three parts: FCSetupRound (maps, request sets,
+  // send slot, shell receives started), FCLaunchPackRound + FCStartSendsRound (pack and
+  // send the shell), FCFillRound (local fill, wait, remote fill).  FCRound carries what the
+  // parts share.  InitRecvMG arms the round (fc_early_set_ = its set id) so that
+  // PackAndSendMG sends the shell with the same-level halo under one fence and
+  // FillFineCoarseMGGhosts only fills; a caller without InitRecvMG gets all three parts
+  // from FillFineCoarseMGGhosts itself.
+  struct FCRound {
+    bool active = false;   // a fill is due
+    bool sent = false;     // the shell sends have been started
+    bool include_diagonals = false;
+    int set_id = -1;
+    int nvar = 0, ngh = 0, ncells = 0;
+    int ni_tot = 0, nj_tot = 0, nk_tot = 0;
+    bool use_remote_compact = false;
+    bool has_local_fc_neighbors = false;
+    bool remote_fc_active = false;
+    int remote_is = 0, remote_ni = 0, remote_nj = 0, remote_nk = 0;
+    int remote_cell_count = 0, remote_block_size = 0;
+    int remote_send_slot = 0;
+    int nrecv_remote = 0, nsend_remote = 0;
+    int posted_remote_recv = 0;
+    bool gpu_remote_no_errors = true;
+    DvceArray1D<int> remote_cmp2full_d, remote_full2cmp_d, send_m_d;
+    DvceArray2D<int> remote_ridx_d;
+    DvceArray1D<Real> recv_data_d, send_data_d;
+  };
+  int FCSetId(bool include_diagonals) const {
+    return 2*pmy_mg->GetLevelShift() + (include_diagonals ? 1 : 0);
+  }
+  bool FCSetupRound(int nvar, int ni_tot, int nj_tot, int nk_tot, bool include_diagonals,
+                    FCRound &r);
+  bool FCLaunchPackRound(const DvceArray5D<Real> &u, const FCRound &r, DevExeSpace &exec);
+  void FCStartSendsRound(FCRound &r);
+  void FCFillRound(DvceArray5D<Real> &u, FCRound &r);
+  void FCPackAndSendNow(const DvceArray5D<Real> &u, FCRound &r);
+  void FCArmEarly(int nvars, bool include_diagonals);
+  FCRound *FCEarlyRoundForSend(bool include_diagonals);
+ private:
+  bool UseMGSameLevelAgg() const;
+  //! \brief the current same-level round sends one colour only
+  bool MGSameColourActive(bool include_diagonals) const {
+    return mg_same_colour_ >= 0 && !include_diagonals && mg_same_colour_ok_;
+  }
+  void BuildMGSameLevelAggCache(int nvars, bool include_diagonals);
+  void EnsureMGSameLevelAggReady(int nvars, bool include_diagonals);
+  //! \brief note that an unpack kernel is in flight over receive storage `store`
+  void MarkMGUnpackPending(int store);
+  //! \brief wait for the unpacks of `store`, and only those, to retire
+  void WaitMGUnpackComplete(int store);
+  //! \brief wait for every pending unpack, for the paths that move the buffers themselves
+  void WaitMGUnpackCompleteAll();
+  //! \brief refresh the cached fine/coarse topology scan if the mesh has changed
+  void EnsureFCTopologyScan(std::uint64_t mesh_sig, int nmb, int nnghbr);
+  //! \brief drop everything cached about the MeshBlock topology
+  void InvalidateMGTopologyCaches();
+#if MPI_PARALLEL_ENABLED
+  // The set of persistent send requests that the last send started in `slot` belongs to.
+  std::vector<MPI_Request> &SendReqs(int slot) {
+    return mg_same_send_slot_half_[slot] ? mg_same_send_req_half_h_[slot]
+                                         : mg_same_send_req_h_[slot];
+  }
+  void SwapMGSameLevelAggState(MGSameLevelAggState &state);
+  void FreeMGSameLevelAggState(MGSameLevelAggState &state);
+  void InvalidateMGSameLevelAggCache();
+  FCRemotePersistentSet *FCRemoteSlotSet(int slot);
+  void FreeFCRemotePersistentSet(int set);
+  void WaitFCRemoteSendSlots();
+#endif
+  // data
+  Multigrid *pmy_mg;
+  std::array<FCRemoteTopology, 2> fc_remote_topo_;
+  // The round InitRecvMG has armed (-1: none) and its state.
+  int fc_early_set_ = -1;
+  FCRound fc_round_;
+  // Remote fine/coarse payload buffers.  The layout is FLAT and entry-major: entry e of
+  // the current level occupies [e*remote_block_size, (e+1)*remote_block_size), so MPI
+  // offsets/counts stay compact per level and no padding is ever transmitted.  The
+  // allocation is sized from the FINEST level and only ever grows, because the
+  // persistent requests above are bound to .data() and any reallocation moves it.
+  DvceArray1D<Real> fc_recv_data_d_{"mg_fc_recv_data", 0};
+  std::array<DvceArray1D<Real>, 2> fc_send_data_d_{
+      DvceArray1D<Real>("mg_fc_send_data0", 0),
+      DvceArray1D<Real>("mg_fc_send_data1", 0)};
+  std::vector<FCRemoteCompactMap> fc_remote_compact_maps_;
+  DvceArray1D<int> fc_ngh_ox1_d_, fc_ngh_ox2_d_, fc_ngh_ox3_d_;
+  DvceArray1D<int> fc_ngh_f1_d_, fc_ngh_f2_d_, fc_ngh_nface_d_, fc_ngh_valid_d_;
+  std::vector<int> fc_ngh_ox1_h_, fc_ngh_ox2_h_, fc_ngh_ox3_h_, fc_ngh_nface_h_;
+  // Which fine/coarse neighbours this rank has at all.  This is a property of the
+  // MeshBlock tree, not of the multigrid level, so it changes only when the mesh does;
+  // recomputing it meant two nmb*nnghbr host sweeps on every prolongation step.
+  std::uint64_t fc_scan_mesh_sig_;
+  int fc_scan_nmb_;
+  int fc_scan_nnghbr_;
+  bool fc_scan_valid_;
+  bool fc_scan_has_local_;
+  bool fc_scan_has_remote_;
+  bool fc_scan_has_remote_face_;
+  int fc_ngh_map_nnghbr_;
+  bool fc_ngh_map_valid_;
+  std::array<bool, 2> fc_remote_send_slot_inflight_;
+  // Index of the persistent request set that owns each in-flight send slot, -1 if
+  // none.
+  std::array<int, 2> fc_remote_send_slot_set_;
+  bool fc_remote_send_inflight_;
+#if MPI_PARALLEL_ENABLED
+  std::vector<FCRemotePersistentSet> fc_remote_persistent_;
+#endif
+  int fc_remote_send_pack_slot_;
+  DvceArray1D<int> mg_same_send_m_d_, mg_same_send_off_d_, mg_same_send_off_half_d_;
+  DvceArray1D<int> mg_same_recv_m_d_, mg_same_recv_off_d_, mg_same_recv_off_half_d_;
+  DvceArray2D<int> mg_same_send_bounds_d_, mg_same_recv_bounds_d_;
+  std::array<DvceArray1D<Real>, 2> mg_same_send_data_d_;
+  // Two receive slots, for the same reason the send side has two: MPI must not write a
+  // payload the unpack kernel of the previous exchange is still reading.  With one slot
+  // that is a host wait on that kernel at the top of every InitRecvMG(); alternating
+  // slots pushes the constraint back to the exchange before last, which has had a whole
+  // round of device work queued behind it and is in practice already retired.  The
+  // persistent requests are duplicated per slot -- MPI_Recv_init binds an address, so
+  // one set per buffer -- and only ever one set is started at a time, so the two sets
+  // cannot compete for the same incoming message.
+  std::array<DvceArray1D<Real>, 2> mg_same_recv_data_d_;
+  std::vector<int> mg_same_send_rank_h_;
+  std::vector<int> mg_same_send_data_off_h_, mg_same_send_tag_h_;
+  std::vector<int> mg_same_recv_rank_h_;
+  std::vector<int> mg_same_recv_data_off_h_, mg_same_recv_tag_h_;
+#if MPI_PARALLEL_ENABLED
+  std::array<std::vector<MPI_Request>, 2> mg_same_send_req_h_;
+  std::array<std::vector<MPI_Request>, 2> mg_same_send_req_half_h_;
+  std::array<std::vector<MPI_Request>, 2> mg_same_recv_req_h_;
+  std::array<bool, 2> mg_same_send_slot_half_{false, false};
+#endif
+  std::uint64_t mg_same_mesh_sig_;
+  int mg_same_halo_depth_ = 1;
+  // Colour of the cells the next face-only exchange has to carry, -1 for all of them.
+  int mg_same_colour_ = -1;
+  // The cached level/mode honours mg_same_colour_: depth 1, face-only, even block edges
+  // and an even row length in every entry.
+  bool mg_same_colour_ok_ = false;
+  int mg_same_shift_;
+  int mg_same_nvars_;
+  bool mg_same_include_diagonals_;
+  bool mg_same_cache_valid_;
+  std::array<bool, 2> mg_same_send_slot_inflight_;
+  bool mg_same_send_inflight_;
+  bool mg_same_recv_inflight_;
+  bool mg_same_persistent_ready_;
+  bool mg_same_has_remote_;
+  int mg_same_poll_budget_;
+  int mg_same_send_poll_count_;
+  int mg_same_recv_poll_count_;
+  int mg_same_send_pack_slot_;
+  // Receive slot the next MPI_Startall posts into, and the slot holding the payload the
+  // next unpack consumes.  At most one receive is ever started, so one of each suffices.
+  int mg_same_recv_post_slot_;
+  int mg_same_recv_data_slot_;
+  // Raised while an unpack kernel may still be reading that storage's payload.
+  std::array<bool, kMGNumRecvStores> mg_unpack_pending_;
+#if defined(KOKKOS_ENABLE_CUDA)
+  // Recorded on the Kokkos stream immediately after the unpack that reads the storage,
+  // so waiting on it releases the buffer as soon as that kernel retires and leaves the
+  // smoother and boundary kernels queued behind it running.  A plain device fence would
+  // drain those too, and a receive that is not posted cannot start its rendezvous, so
+  // nothing on the wire could overlap them.  An event carries no identity beyond "the
+  // most recent unpack of this storage", which is all the buffer needs: the stream is
+  // in-order, so any earlier unpack of the same storage -- including one from a multigrid
+  // level whose state has since been swapped out -- has retired by then as well.
+  std::array<cudaEvent_t, kMGNumRecvStores> mg_unpack_event_;
+  std::array<bool, kMGNumRecvStores> mg_unpack_event_valid_;
+#endif
+#if MPI_PARALLEL_ENABLED
+  std::vector<MGSameLevelAggState> mg_same_level_cache_;
+  std::uint64_t mg_same_level_cache_mesh_sig_ = 0;
+  int mg_same_active_cache_key_ = -1;
+#endif
+  std::vector<DvceArray1D<int>> mg_single_pair_m_cache_d_, mg_single_pair_sm_cache_d_;
+  std::vector<DvceArray2D<int>> mg_single_pair_desc_cache_d_;
+  std::vector<int> mg_single_pair_count_cache_;
+  std::vector<int> mg_single_cached_nmb_cache_, mg_single_cached_nnghbr_cache_;
+  std::vector<int> mg_single_cached_mbgid0_cache_, mg_single_cached_nx1_cache_;
+  std::vector<std::uint64_t> mg_single_cached_mesh_sig_cache_;
+  std::vector<int> mg_single_pair_valid_cache_;
+  // functions
 };
 
 template <typename ViewType, typename StencilOp>
-void Multigrid::Smooth(ViewType &u, const ViewType &src, const ViewType &coeff,
-                       const ViewType &matrix, const StencilOp &stencil, int rlev,
-                       int il, int iu, int jl, int ju, int kl, int ku, int color,
-                       bool th) {
+void Multigrid::Smooth(ViewType &u, const ViewType &src, const StencilOp &stencil,
+                       int rlev, int il, int iu, int jl, int ju, int kl, int ku,
+                       int color) {
   using ExeSpace = typename ViewType::execution_space;
   auto brdx = [this]() {
     if constexpr (std::is_same_v<ExeSpace, HostExeSpace>)
@@ -630,19 +1107,35 @@ void Multigrid::Smooth(ViewType &u, const ViewType &src, const ViewType &coeff,
     else
       return block_rdx_.d_view;
   }();
+  auto block_parity = [this]() {
+    if constexpr (std::is_same_v<ExeSpace, HostExeSpace>)
+      return block_color_parity_.h_view;
+    else
+      return block_color_parity_.d_view;
+  }();
   int rlev_l = rlev;
   Real odiag = stencil.omega_over_diag;
   color ^= pmy_driver_->GetCoffset();
-  par_for("Multigrid::Smooth", ExeSpace(), 0, nmmb_-1, kl, ku, jl, ju,
-  KOKKOS_LAMBDA(const int m, const int k, const int j) {
+  const int parity_origin = ngh_;
+  const int level_shift = (rlev_l < 0) ? -rlev_l : 0;
+  const int block_cells_odd = (indcs_.nx1 >> level_shift) & 1;
+  // One thread per cell of the colour, with the x index the fastest-running one, so a
+  // warp walks 2*32 consecutive cells of a row instead of 32 different rows.  The
+  // neighbours a red cell reads are the black cells in between, so every cache line the
+  // warp pulls in is used whole.  Cells of one colour never depend on each other, so
+  // the update is the same arithmetic in a different order: bitwise identical.
+  const int nhalf = (iu - il)/2 + 1;
+  par_for("Multigrid::Smooth", ExeSpace(), 0, nmmb_-1, kl, ku, jl, ju, 0, nhalf-1,
+  KOKKOS_LAMBDA(const int m, const int k, const int j, const int ih) {
+    const int block_color = color ^ (block_cells_odd & block_parity(m));
+    const int c = (block_color + k + j) & 1;
+    const int i = il + (((il - parity_origin) & 1) ^ c) + 2*ih;
+    if (i > iu) return;
     Real dx = (rlev_l <= 0) ? brdx(m) * static_cast<Real>(1<<(-rlev_l))
                             : brdx(m) / static_cast<Real>(1<<rlev_l);
     Real dx2 = dx * dx;
-    const int c = (color + k + j) & 1;
-    for (int i = il + c; i <= iu; i += 2) {
-      Real lap = stencil.Apply(u, coeff, m, 0, k, j, i);
-      u(m,0,k,j,i) -= (lap - src(m,0,k,j,i)*dx2) * odiag;
-    }
+    Real lap = stencil.Apply(u, m, 0, k, j, i);
+    u(m,0,k,j,i) -= (lap - src(m,0,k,j,i)*dx2) * odiag;
   });
 }
 
@@ -677,11 +1170,11 @@ inline const Real& BufRef(const std::vector<Real> &buf, int nc,
 }
 
 KOKKOS_INLINE_FUNCTION
-Real EvalMultipolePhi(Real x, Real y, Real z,
-                      const Real *mpc, int order) {
+Real EvalMultipolePhi(Real x, Real y, Real z, const Real *mpc, int order) {
   Real x2 = x*x, y2 = y*y, z2 = z*z;
   Real xy = x*y, yz = y*z, zx = z*x;
   Real r2 = x2 + y2 + z2;
+  if (r2 == 0.0) return 0.0;
   Real ir2 = 1.0/r2, ir1 = Kokkos::sqrt(ir2);
   Real ir3 = ir2*ir1, ir5 = ir3*ir2;
   Real hx2my2 = 0.5*(x2-y2);

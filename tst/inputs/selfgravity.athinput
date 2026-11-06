@@ -1,7 +1,7 @@
 # AthenaK input file for multigrid Poisson solver tests (poisson3d)
 
 <comment>
-problem   = SelfGravity 
+problem   = SelfGravity
 
 <job>
 basename  = MGGravityTest

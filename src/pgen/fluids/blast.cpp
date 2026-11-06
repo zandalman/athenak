@@ -140,6 +140,11 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     t0 = pin->GetOrAddReal("problem", "t0", 0.0);
     fac = v_max / R_max0;
     pmbp->padm->SetADMVariables = &SetADMVariablesToFLRW;
+  } else if (pmbp->padm != nullptr) {
+    // The default ADM callback writes the static <coord> metric (Minkowski for m = 0) to
+    // every block each stage, the same values at any time, so any LAT bin may call it.
+    // The expanding FLRW metric above depends on the time and is not declared safe.
+    pmbp->padm->lat_active_safe = true;
   }
 
   if (restart) return;
@@ -300,95 +305,97 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
       w0_(m,IEN,k,j,i) = pres/gm1;
     });
 
-    // initialize magnetic fields
-    // compute vector potential over all faces
-    int ncells1 = indcs.nx1 + 2*(indcs.ng);
-    int ncells2 = (indcs.nx2 > 1)? (indcs.nx2 + 2*(indcs.ng)) : 1;
-    int ncells3 = (indcs.nx3 > 1)? (indcs.nx3 + 2*(indcs.ng)) : 1;
-    int nmb = pmbp->nmb_thispack;
-    DvceArray4D<Real> a3;
-    Kokkos::realloc(a3, nmb,ncells3,ncells2,ncells1);
+    if (pmbp->pmhd->HasField()) {
+      // initialize magnetic fields
+      // compute vector potential over all faces
+      int ncells1 = indcs.nx1 + 2*(indcs.ng);
+      int ncells2 = (indcs.nx2 > 1)? (indcs.nx2 + 2*(indcs.ng)) : 1;
+      int ncells3 = (indcs.nx3 > 1)? (indcs.nx3 + 2*(indcs.ng)) : 1;
+      int nmb = pmbp->nmb_thispack;
+      DvceArray4D<Real> a3;
+      Kokkos::realloc(a3, nmb,ncells3,ncells2,ncells1);
 
-    auto &nghbr = pmbp->pmb->nghbr;
-    auto &mblev = pmbp->pmb->mb_lev;
+      auto &nghbr = pmbp->pmb->nghbr;
+      auto &mblev = pmbp->pmb->mb_lev;
 
-    int ku = ke;
-    if (ncells3 > 1) {
-      ku = ke + 1;
+      int ku = ke;
+      if (ncells3 > 1) {
+        ku = ke + 1;
+      }
+
+      par_for("pgen_potential", DevExeSpace(), 0,nmb-1,ks,ku,js,je+1,is,ie+1,
+      KOKKOS_LAMBDA(int m, int k, int j, int i) {
+        Real &x1min = size.d_view(m).x1min;
+        Real &x1max = size.d_view(m).x1max;
+        int nx1 = indcs.nx1;
+        Real x1v = CellCenterX(i-is, nx1, x1min, x1max);
+        Real x1f = LeftEdgeX(i-is,nx1,x1min,x1max);
+
+        Real &x2min = size.d_view(m).x2min;
+        Real &x2max = size.d_view(m).x2max;
+        int nx2 = indcs.nx2;
+        Real x2v = CellCenterX(j-js, nx2, x2min, x2max);
+        Real x2f = LeftEdgeX(j-js,nx2,x2min,x2max);
+
+        Real &x3min = size.d_view(m).x3min;
+        Real &x3max = size.d_view(m).x3max;
+        int nx3 = indcs.nx3;
+        Real x3v = CellCenterX(k-ks, nx3, x3min, x3max);
+        Real x3f = LeftEdgeX(k-ks,nx3,x3min,x3max);
+
+        Real dx1 = size.d_view(m).dx1;
+        Real dx2 = size.d_view(m).dx2;
+        Real dx3 = size.d_view(m).dx3;
+
+        Real y = x2f;
+
+        if (warp) {
+          y = GetCartesianFromScrewball(x2f, a_warp);
+        } else if (ripple) {
+          Real x;
+          GetCartesianFromRipple(x, y, x1f, x2f, A_snake, k_snake);
+        }
+
+        a3(m,k,j,i) = b_amb*y;
+      });
+
+
+      // initialize magnetic fields
+      auto &b0 = pmbp->pmhd->b0;
+      par_for("pgen_blast2",DevExeSpace(),0,(pmbp->nmb_thispack-1),ks,ke,js,je,is,ie,
+      KOKKOS_LAMBDA(int m, int k, int j, int i) {
+        Real dx1 = size.d_view(m).dx1;
+        Real dx2 = size.d_view(m).dx2;
+
+        b0.x1f(m,k,j,i) = (a3(m,k,j+1,i) - a3(m,k,j,i))/dx2;
+        b0.x2f(m,k,j,i) = -(a3(m,k,j,i+1) - a3(m,k,j,i))/dx1;
+        b0.x3f(m,k,j,i) = 0.0;
+        if (i==ie) {
+          b0.x1f(m,k,j,i+1) = (a3(m,k,j+1,i+1) - a3(m,k,j,i+1))/dx2;
+        }
+        if (j==je) {
+          b0.x2f(m,k,j+1,i) = -(a3(m,k,j+1,i+1) - a3(m,k,j+1,i))/dx1;
+        }
+        if (k==ke) {b0.x3f(m,k+1,j,i) = 0.0;}
+      });
+
+      // Compute cell-centered fields
+      auto &bcc_ = pmbp->pmhd->bcc0;
+      par_for("pgen_blast3",DevExeSpace(),0,(pmbp->nmb_thispack-1),ks,ke,js,je,is,ie,
+      KOKKOS_LAMBDA(int m, int k, int j, int i) {
+        // cell-centered fields are simple linear average of face-centered fields
+        Real& w_bx = bcc_(m,IBX,k,j,i);
+        Real& w_by = bcc_(m,IBY,k,j,i);
+        Real& w_bz = bcc_(m,IBZ,k,j,i);
+        w_bx = 0.5*(b0.x1f(m,k,j,i) + b0.x1f(m,k,j,i+1));
+        w_by = 0.5*(b0.x2f(m,k,j,i) + b0.x2f(m,k,j+1,i));
+        w_bz = 0.5*(b0.x3f(m,k,j,i) + b0.x3f(m,k+1,j,i));
+      });
     }
-
-    par_for("pgen_potential", DevExeSpace(), 0,nmb-1,ks,ku,js,je+1,is,ie+1,
-    KOKKOS_LAMBDA(int m, int k, int j, int i) {
-      Real &x1min = size.d_view(m).x1min;
-      Real &x1max = size.d_view(m).x1max;
-      int nx1 = indcs.nx1;
-      Real x1v = CellCenterX(i-is, nx1, x1min, x1max);
-      Real x1f = LeftEdgeX(i-is,nx1,x1min,x1max);
-
-      Real &x2min = size.d_view(m).x2min;
-      Real &x2max = size.d_view(m).x2max;
-      int nx2 = indcs.nx2;
-      Real x2v = CellCenterX(j-js, nx2, x2min, x2max);
-      Real x2f = LeftEdgeX(j-js,nx2,x2min,x2max);
-
-      Real &x3min = size.d_view(m).x3min;
-      Real &x3max = size.d_view(m).x3max;
-      int nx3 = indcs.nx3;
-      Real x3v = CellCenterX(k-ks, nx3, x3min, x3max);
-      Real x3f = LeftEdgeX(k-ks,nx3,x3min,x3max);
-
-      Real dx1 = size.d_view(m).dx1;
-      Real dx2 = size.d_view(m).dx2;
-      Real dx3 = size.d_view(m).dx3;
-
-      Real y = x2f;
-
-      if (warp) {
-        y = GetCartesianFromScrewball(x2f, a_warp);
-      } else if (ripple) {
-        Real x;
-        GetCartesianFromRipple(x, y, x1f, x2f, A_snake, k_snake);
-      }
-
-      a3(m,k,j,i) = b_amb*y;
-    });
-
-
-    // initialize magnetic fields
-    auto &b0 = pmbp->pmhd->b0;
-    par_for("pgen_blast2",DevExeSpace(),0,(pmbp->nmb_thispack-1),ks,ke,js,je,is,ie,
-    KOKKOS_LAMBDA(int m, int k, int j, int i) {
-      Real dx1 = size.d_view(m).dx1;
-      Real dx2 = size.d_view(m).dx2;
-
-      b0.x1f(m,k,j,i) = (a3(m,k,j+1,i) - a3(m,k,j,i))/dx2;
-      b0.x2f(m,k,j,i) = -(a3(m,k,j,i+1) - a3(m,k,j,i))/dx1;
-      b0.x3f(m,k,j,i) = 0.0;
-      if (i==ie) {
-        b0.x1f(m,k,j,i+1) = (a3(m,k,j+1,i+1) - a3(m,k,j,i+1))/dx2;
-      }
-      if (j==je) {
-        b0.x2f(m,k,j+1,i) = -(a3(m,k,j+1,i+1) - a3(m,k,j+1,i))/dx1;
-      }
-      if (k==ke) {b0.x3f(m,k+1,j,i) = 0.0;}
-    });
-
-    // Compute cell-centered fields
-    auto &bcc_ = pmbp->pmhd->bcc0;
-    par_for("pgen_blast3",DevExeSpace(),0,(pmbp->nmb_thispack-1),ks,ke,js,je,is,ie,
-    KOKKOS_LAMBDA(int m, int k, int j, int i) {
-      // cell-centered fields are simple linear average of face-centered fields
-      Real& w_bx = bcc_(m,IBX,k,j,i);
-      Real& w_by = bcc_(m,IBY,k,j,i);
-      Real& w_bz = bcc_(m,IBZ,k,j,i);
-      w_bx = 0.5*(b0.x1f(m,k,j,i) + b0.x1f(m,k,j,i+1));
-      w_by = 0.5*(b0.x2f(m,k,j,i) + b0.x2f(m,k,j+1,i));
-      w_bz = 0.5*(b0.x3f(m,k,j,i) + b0.x3f(m,k+1,j,i));
-    });
 
     // Convert primitives to conserved
     if (!pmbp->pcoord->is_dynamical_relativistic) {
-      pmbp->pmhd->peos->PrimToCons(w0_, bcc_, pmbp->pmhd->u0, is, ie, js, je, ks, ke);
+      pmbp->pmhd->peos->PrimToCons(w0_, pmbp->pmhd->bcc0, pmbp->pmhd->u0, is, ie, js, je, ks, ke);
     }
   }  // End initialization MHD variables
 
@@ -405,6 +412,7 @@ namespace {
 //----------------------------------------------------------------------------------------
 void SetADMVariablesToFLRW(MeshBlockPack *pmbp) {
   const Real t = pmbp->pmesh->time;
+  const Real fac_local = fac;
   auto &adm = pmbp->padm->adm;
   auto &size = pmbp->pmb->mb_size;
   auto &indcs = pmbp->pmesh->mb_indcs;
@@ -418,7 +426,6 @@ void SetADMVariablesToFLRW(MeshBlockPack *pmbp) {
 
   Real a = 1.0 + fac*(t-t0);
   Real a2 = a*a;
-  Real fac_ = fac;   // local copy: capturable by device lambda
   par_for("update_adm_vars", DevExeSpace(), 0,nmb-1,0,(n3-1),0,(n2-1),0,(n1-1),
   KOKKOS_LAMBDA(int m, int k, int j, int i) {
     Real &x1min = size.d_view(m).x1min;
@@ -440,12 +447,12 @@ void SetADMVariablesToFLRW(MeshBlockPack *pmbp) {
     adm.g_dd(m,1,2,k,j,i) = 0.0;
     adm.g_dd(m,2,2,k,j,i) = a2;
 
-    adm.vK_dd(m,0,0,k,j,i) = -a*fac_;
+      adm.vK_dd(m,0,0,k,j,i) = -a*fac_local;
     adm.vK_dd(m,0,1,k,j,i) = 0.0;
     adm.vK_dd(m,0,2,k,j,i) = 0.0;
-    adm.vK_dd(m,1,1,k,j,i) = -a*fac_;
+      adm.vK_dd(m,1,1,k,j,i) = -a*fac_local;
     adm.vK_dd(m,1,2,k,j,i) = 0.0;
-    adm.vK_dd(m,2,2,k,j,i) = -a*fac_;
+      adm.vK_dd(m,2,2,k,j,i) = -a*fac_local;
 
     adm.alpha(m,k,j,i) = 1.0;
     adm.beta_u(m,0,k,j,i) = 0.0;

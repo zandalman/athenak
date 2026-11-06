@@ -1,0 +1,57 @@
+<job>
+basename = hlld_loop
+
+<mesh>
+nghost = 3
+nx1 = 240
+x1min = -0.5
+x1max = 0.5
+ix1_bc = periodic
+ox1_bc = periodic
+nx2 = 240
+x2min = -0.5
+x2max = 0.5
+ix2_bc = periodic
+ox2_bc = periodic
+nx3 = 1
+x3min = -0.5
+x3max = 0.5
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 60
+nx2 = 60
+nx3 = 1
+
+<coord>
+special_rel = true
+
+<time>
+evolution = dynamic
+integrator = rk3
+cfl_number = 0.25
+nlim = -1
+tlim = 24.0
+ndiag = 2000
+
+<mhd>
+eos = ideal
+reconstruct = wenoz
+rsolver = hlld
+gamma = 1.3333333333333333
+
+<problem>
+pgen_name = field_loop
+iprob = 1
+rad = 0.3
+amp = 1.0e-3
+press = 3.0
+vx = 0.0833333333333333
+vy = 0.0416666666666667
+vz = 0.0
+
+<output1>
+file_type = bin
+variable = mhd_bcc
+dt = 24.0

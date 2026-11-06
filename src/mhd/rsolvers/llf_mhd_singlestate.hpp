@@ -190,17 +190,35 @@ void SingleStateLLF_SRMHD(const MHDPrim1D &wl, const MHDPrim1D &wr, const Real &
 }
 
 //----------------------------------------------------------------------------------------
-//! \fn void SingleStateLLF_GRMHD
-//! \brief The LLF Riemann solver for GR MHD for a single L/R state
+//! \fn void SingleStateLLF_GRMHD_InMetric
+//! \brief The LLF Riemann solver for GR MHD for a single L/R state, in a metric the
+//! caller already has.
+//!
+//! Nothing below this point is Kerr-Schild: the solve is written out in glower/gupper and
+//! an ideal-gas EOS_Data, so it is the single-state ideal-GRMHD LLF of ANY four-metric.
+//! That is what lets a first-order rescue and an excision flux
+//! boundary run unchanged on the dynamical path, where the metric comes from
+//! the evolved four-metric instead of the closed form, with the gas law of
+//! <mhd>/dyn_eos = ideal.  The two quantities a first-order rescue
+//! consumes, the mass flux (for the outflow sign) and the extremal speed,
+//! are the same numbers in either conserved-energy convention.
 
+template <bool capture_speed = false>
 KOKKOS_INLINE_FUNCTION
-void SingleStateLLF_GRMHD(const MHDPrim1D wl, const MHDPrim1D wr, const Real bx,
-                          const Real x1v, const Real x2v, const Real x3v, const int ivx,
-                          const CoordData &coord, const EOS_Data &eos, MHDCons1D &flux) {
+void SingleStateLLF_GRMHD_InMetric(const MHDPrim1D wl, const MHDPrim1D wr, const Real bx,
+                          const Real glower[4][4], const Real gupper[4][4], const int ivx,
+                          const EOS_Data &eos,
+                          const Real gamma_l_in, const Real gamma_r_in,
+                          MHDCons1D &flux, Real *lambda_out = nullptr,
+                          Real *lambda_l_out = nullptr,
+                          Real *lambda_r_out = nullptr) {
   // Cyclic permutation of array indices
   int ivy = IVX + ((ivx-IVX)+1)%3;
   int ivz = IVX + ((ivx-IVX)+2)%3;
-  const Real gamma_prime = eos.gamma/(eos.gamma - 1.0);
+  const Real gamma_l = (gamma_l_in > 1.0) ? gamma_l_in : eos.gamma;
+  const Real gamma_r = (gamma_r_in > 1.0) ? gamma_r_in : eos.gamma;
+  const Real gamma_prime_l = gamma_l/(gamma_l - 1.0);
+  const Real gamma_prime_r = gamma_r/(gamma_r - 1.0);
 
   // References to left primitives
   const Real &wl_idn=wl.d;
@@ -219,15 +237,11 @@ void SingleStateLLF_GRMHD(const MHDPrim1D wl, const MHDPrim1D wr, const Real bx,
   const Real &wr_ibz=wr.bz;
 
   Real wl_ipr, wr_ipr;
-  wl_ipr = eos.IdealGasPressure(wl.e);
-  wr_ipr = eos.IdealGasPressure(wr.e);
+  wl_ipr = (gamma_l - 1.0) * wl.e;
+  wr_ipr = (gamma_r - 1.0) * wr.e;
 
   // reference to longitudinal field
   const Real &bxi = bx;
-
-  // Extract components of metric
-  Real glower[4][4], gupper[4][4];
-  ComputeMetricAndInverse(x1v,x2v,x3v,coord.is_minkowski, coord.bh_spin, glower, gupper);
 
   // Calculate 4-velocity in left state (contravariant compt)
   Real q = glower[ivx][ivx] * SQR(wl_ivx) + glower[ivy][ivy] * SQR(wl_ivy) +
@@ -328,27 +342,39 @@ void SingleStateLLF_GRMHD(const MHDPrim1D wl, const MHDPrim1D wr, const Real bx,
 
   Real bsq_r = blr[0]*bur[0] + blr[ivx]*bur[ivx] + blr[ivy]*bur[ivy] +blr[ivz]*bur[ivz];
 
+  EOS_Data eos_l = eos;
+  EOS_Data eos_r = eos;
+  eos_l.gamma = gamma_l;
+  eos_r.gamma = gamma_r;
+
   // Calculate wavespeeds in left state
   Real lp_l, lm_l;
-  eos.IdealGRMHDFastSpeeds(wl_idn, wl_ipr, uul[0], uul[ivx], bsq_l, gupper[0][0],
-                           gupper[0][ivx], gupper[ivx][ivx], lp_l, lm_l);
+  eos_l.IdealGRMHDFastSpeeds(wl_idn, wl_ipr, uul[0], uul[ivx], bsq_l,
+                             gupper[0][0], gupper[0][ivx], gupper[ivx][ivx],
+                             lp_l, lm_l);
 
   // Calculate wavespeeds in right state
   Real lp_r, lm_r;
-  eos.IdealGRMHDFastSpeeds(wr_idn, wr_ipr, uur[0], uur[ivx], bsq_r, gupper[0][0],
-                           gupper[0][ivx], gupper[ivx][ivx], lp_r, lm_r);
+  eos_r.IdealGRMHDFastSpeeds(wr_idn, wr_ipr, uur[0], uur[ivx], bsq_r,
+                             gupper[0][0], gupper[0][ivx], gupper[ivx][ivx],
+                             lp_r, lm_r);
 
   // Calculate extremal wavespeeds
   Real lambda_l = fmin(lm_l, lm_r);
   Real lambda_r = fmax(lp_l, lp_r);
   Real lambda = fmax(lambda_r, -lambda_l);
+  if constexpr (capture_speed) {
+    if (lambda_out != nullptr) *lambda_out = lambda;
+    if (lambda_l_out != nullptr) *lambda_l_out = lambda_l;
+    if (lambda_r_out != nullptr) *lambda_r_out = lambda_r;
+  }
 
   // Calculate difference du =  U_R - U_l in conserved quantities (rho u^0 and T^0_\mu)
   MHDCons1D du;
-  Real wtot_r = wr_idn + gamma_prime * wr_ipr + bsq_r;
+  Real wtot_r = wr_idn + gamma_prime_r * wr_ipr + bsq_r;
   Real ptot_r = wr_ipr + 0.5*bsq_r;
   Real qa = wtot_r * uur[0];
-  Real wtot_l = wl_idn + gamma_prime * wl_ipr + bsq_l;
+  Real wtot_l = wl_idn + gamma_prime_l * wl_ipr + bsq_l;
   Real ptot_l = wl_ipr + 0.5*bsq_l;
   Real qb = wtot_l * uul[0];
   du.d  = (wr_idn*uur[0]) - (wl_idn*uul[0]);
@@ -393,6 +419,36 @@ void SingleStateLLF_GRMHD(const MHDPrim1D wl, const MHDPrim1D wr, const Real bx,
   // We evolve tau = T^t_t + D
   flux.e  += flux.d;
   return;
+}
+
+//----------------------------------------------------------------------------------------
+//! \fn void SingleStateLLF_GRMHD
+//! \brief The same solve at a Cartesian Kerr-Schild / Minkowski coordinate.  Building the
+//! metric here and forwarding keeps every fixed-metric call site spelled exactly as it
+//! was.
+
+template <bool capture_speed = false>
+KOKKOS_INLINE_FUNCTION
+void SingleStateLLF_GRMHD(const MHDPrim1D wl, const MHDPrim1D wr, const Real bx,
+                          const Real x1v, const Real x2v, const Real x3v, const int ivx,
+                          const CoordData &coord, const EOS_Data &eos,
+                          const Real gamma_l_in, const Real gamma_r_in,
+                          MHDCons1D &flux, Real *lambda_out = nullptr,
+                          Real *lambda_l_out = nullptr,
+                          Real *lambda_r_out = nullptr) {
+  Real glower[4][4], gupper[4][4];
+  ComputeMetricAndInverse(x1v,x2v,x3v,coord.Hole(), glower, gupper);
+  SingleStateLLF_GRMHD_InMetric<capture_speed>(
+      wl, wr, bx, glower, gupper, ivx, eos, gamma_l_in, gamma_r_in, flux,
+      lambda_out, lambda_l_out, lambda_r_out);
+}
+
+KOKKOS_INLINE_FUNCTION
+void SingleStateLLF_GRMHD(const MHDPrim1D wl, const MHDPrim1D wr, const Real bx,
+                          const Real x1v, const Real x2v, const Real x3v, const int ivx,
+                          const CoordData &coord, const EOS_Data &eos, MHDCons1D &flux) {
+  SingleStateLLF_GRMHD(wl, wr, bx, x1v, x2v, x3v, ivx, coord, eos, eos.gamma,
+                       eos.gamma, flux);
 }
 
 } // namespace mhd

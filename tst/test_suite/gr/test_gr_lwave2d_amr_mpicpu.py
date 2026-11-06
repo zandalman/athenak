@@ -40,6 +40,8 @@ def arguments(iv, rv, fv, wv, res, soe, name):
         "coord/special_rel=false",
         "coord/general_rel=true",
         f"{soe}/reconstruct=" + rv,
+        # wenoz and ppmx on a relativistic fluid require the FOFC closure (hydro.cpp, mhd.cpp)
+        *([f"{soe}/fofc=true"] if rv in ("ppmx", "wenoz") else []),
         f"{soe}/rsolver=" + fv,
         "problem/amp=1.0e-3",
         "problem/wave_flag=" + wv,

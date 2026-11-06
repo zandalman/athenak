@@ -1,0 +1,69 @@
+<comment>
+problem   = colliding +-10 c streams carried at 300 c, dual energy
+
+<job>
+basename = dshock
+
+<mesh>
+nghost = 4
+nx1    = 1024
+x1min  = -0.05
+x1max  = 0.05
+ix1_bc = periodic
+ox1_bc = periodic
+nx2    = 1
+x2min  = -0.5
+x2max  = 0.5
+ix2_bc = periodic
+ox2_bc = periodic
+nx3    = 1
+x3min  = -0.5
+x3max  = 0.5
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 1024
+nx2 = 1
+nx3 = 1
+
+<time>
+evolution  = dynamic
+integrator = rk2
+cfl_number = 0.3
+nlim       = -1
+tlim       = 0.002
+ndiag      = 1000
+
+<hydro>
+eos              = ideal
+reconstruct      = plm
+rsolver          = hlle
+gamma            = 1.6666666666667
+dual_energy      = true
+dual_energy_eta1 = 1.0e-3
+dfloor           = 1.0e-10
+pfloor           = 1.0e-12
+
+<problem>
+pgen_name = shock_tube
+shock_dir = 1
+xshock    = 0.0
+dl        = 1.0
+pl        = 0.6
+ul        = 310.0
+vl        = 0.0
+wl        = 0.0
+dr        = 1.0
+pr        = 0.6
+ur        = 290.0
+vr        = 0.0
+wr        = 0.0
+
+<output1>
+file_type   = tab
+variable    = hydro_w
+data_format = %.12e
+dt          = 0.002
+slice_x2    = 0.0
+slice_x3    = 0.0

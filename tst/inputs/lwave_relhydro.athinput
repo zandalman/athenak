@@ -56,6 +56,7 @@ tlim       = 1.0       # time limit
 ndiag      = 1         # cycles between diagostic output
 
 <hydro>
+fofc = false
 eos         = ideal    # EOS type
 reconstruct = plm      # spatial reconstruction method
 rsolver     = llf      # Riemann-solver to be used

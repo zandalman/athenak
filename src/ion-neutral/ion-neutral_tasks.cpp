@@ -44,13 +44,30 @@ void IonNeutral::AssembleIonNeutralTasks(
   id.impl_2x = tl["stagen"]->AddTask(&IonNeutral::FirstTwoImpRK, this, none);
 
   id.i_flux   = tl["stagen"]->AddTask(&MHD::Fluxes, pmhd, id.impl_2x);
-  id.i_sendf  = tl["stagen"]->AddTask(&MHD::SendFlux, pmhd, id.i_flux);
+  // With fofc the fluxes test the owned cells only; the owners' flags of the first ghost
+  // layer and the face replacement follow before any flux leaves the block.  Each task
+  // returns at once when the exchange is not configured.
+  TaskID i_final_flux = id.i_flux;
+  if (pmhd->use_fofc) {
+    TaskID prep = tl["stagen"]->AddTask(&MHD::PrepareFOFCFlags, pmhd, id.i_flux);
+    TaskID send = tl["stagen"]->AddTask(&MHD::SendFOFCFlags, pmhd, prep);
+    TaskID recv = tl["stagen"]->AddTask(&MHD::RecvFOFCFlags, pmhd, send);
+    i_final_flux = tl["stagen"]->AddTask(&MHD::ReplaceCanonicalFOFC, pmhd, recv);
+  }
+  id.i_sendf  = tl["stagen"]->AddTask(&MHD::SendFlux, pmhd, i_final_flux);
   id.i_recvf  = tl["stagen"]->AddTask(&MHD::RecvFlux, pmhd, id.i_sendf);
   id.i_rkupdt = tl["stagen"]->AddTask(&MHD::RKUpdate, pmhd, id.i_recvf);
   id.i_srctrms   = tl["stagen"]->AddTask(&MHD::MHDSrcTerms, pmhd, id.i_rkupdt);
 
   id.n_flux   = tl["stagen"]->AddTask(&Hydro::Fluxes, phyd, id.i_srctrms);
-  id.n_sendf  = tl["stagen"]->AddTask(&Hydro::SendFlux, phyd, id.n_flux);
+  TaskID n_final_flux = id.n_flux;
+  if (phyd->use_fofc) {
+    TaskID prep = tl["stagen"]->AddTask(&Hydro::PrepareFOFCFlags, phyd, id.n_flux);
+    TaskID send = tl["stagen"]->AddTask(&Hydro::SendFOFCFlags, phyd, prep);
+    TaskID recv = tl["stagen"]->AddTask(&Hydro::RecvFOFCFlags, phyd, send);
+    n_final_flux = tl["stagen"]->AddTask(&Hydro::ReplaceFOFC, phyd, recv);
+  }
+  id.n_sendf  = tl["stagen"]->AddTask(&Hydro::SendFlux, phyd, n_final_flux);
   id.n_recvf  = tl["stagen"]->AddTask(&Hydro::RecvFlux, phyd, id.n_sendf);
   id.n_rkupdt = tl["stagen"]->AddTask(&Hydro::RKUpdate, phyd, id.n_recvf);
   id.n_srctrms   = tl["stagen"]->AddTask(&Hydro::HydroSrcTerms, phyd, id.n_rkupdt);
@@ -72,12 +89,12 @@ void IonNeutral::AssembleIonNeutralTasks(
   id.sendb    = tl["stagen"]->AddTask(&MHD::SendB, pmhd, id.restb);
   id.recvb    = tl["stagen"]->AddTask(&MHD::RecvB, pmhd, id.sendb);
 
-  id.i_bcs    = tl["stagen"]->AddTask(&MHD::ApplyPhysicalBCs, pmhd, id.recvb);
-  id.n_bcs    = tl["stagen"]->AddTask(&Hydro::ApplyPhysicalBCs, phyd, id.n_recvu);
-  id.i_prol   = tl["stagen"]->AddTask(&MHD::Prolongate, pmhd, id.i_bcs);
-  id.n_prol   = tl["stagen"]->AddTask(&Hydro::Prolongate, phyd, id.n_bcs);
-  id.i_c2p    = tl["stagen"]->AddTask(&MHD::ConToPrim, pmhd, id.i_prol);
-  id.n_c2p    = tl["stagen"]->AddTask(&Hydro::ConToPrim, phyd, id.n_prol);
+  id.i_prol   = tl["stagen"]->AddTask(&MHD::Prolongate, pmhd, id.recvb);
+  id.n_prol   = tl["stagen"]->AddTask(&Hydro::Prolongate, phyd, id.n_recvu);
+  id.i_bcs    = tl["stagen"]->AddTask(&MHD::ApplyPhysicalBCs, pmhd, id.i_prol);
+  id.n_bcs    = tl["stagen"]->AddTask(&Hydro::ApplyPhysicalBCs, phyd, id.n_prol);
+  id.i_c2p    = tl["stagen"]->AddTask(&MHD::ConToPrim, pmhd, id.i_bcs);
+  id.n_c2p    = tl["stagen"]->AddTask(&Hydro::ConToPrim, phyd, id.n_bcs);
   id.i_newdt  = tl["stagen"]->AddTask(&MHD::NewTimeStep, pmhd, id.i_c2p);
   id.n_newdt  = tl["stagen"]->AddTask(&Hydro::NewTimeStep, phyd, id.n_c2p);
 
@@ -100,7 +117,7 @@ TaskStatus IonNeutral::FirstTwoImpRK(Driver *pdrive, int stage) {
   hydro::Hydro *phyd = pmy_pack->phydro;
 
   // copy conserved hydro and MHD variables
-  Kokkos::deep_copy(DevExeSpace(), phyd->u1, phyd->u0);
+  DeepCopyToBand(phyd->u1, phyd->u0);
   Kokkos::deep_copy(DevExeSpace(), pmhd->u1, pmhd->u0);
   Kokkos::deep_copy(DevExeSpace(), pmhd->b1.x1f, pmhd->b0.x1f);
   Kokkos::deep_copy(DevExeSpace(), pmhd->b1.x2f, pmhd->b0.x2f);

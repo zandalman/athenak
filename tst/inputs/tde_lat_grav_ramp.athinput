@@ -1,0 +1,134 @@
+# AthenaK reproducer: live external BH with excision and a three-decade gravity
+# coupling ramp (problem/bh_grav_rho_min = gravity/rho_grav_min = 1000 hydro/dfloor).
+# The gas, the BH reaction, the translating frame and the BH timestep all carry the
+# same weight w(rho).  Build with -DPROBLEM=tde_external.
+
+<comment>
+problem = polytrope beside a live softened BH, coupling ramp through the envelope
+
+<job>
+basename = TDELATGravRamp
+
+<mesh>
+nghost = 2
+nx1 = 32
+x1min = -2.0
+x1max = 2.0
+ix1_bc = outflow
+ox1_bc = outflow
+
+nx2 = 32
+x2min = -2.0
+x2max = 2.0
+ix2_bc = outflow
+ox2_bc = outflow
+
+nx3 = 32
+x3min = -2.0
+x3max = 2.0
+ix3_bc = outflow
+ox3_bc = outflow
+
+<meshblock>
+nx1 = 8
+nx2 = 8
+nx3 = 8
+
+<mesh_refinement>
+refinement = static
+max_nmb_per_rank = 256
+
+<refined_region0>
+level = 1
+x1min = -1.0
+x1max = 1.0
+x2min = -1.0
+x2max = 1.0
+x3min = -1.0
+x3max = 1.0
+
+<units>
+mass_cgs = 1.98841586e33
+length_cgs = 1.3914e11
+time_cgs = 1.2709152632111343e3
+mu = 1.0
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.3
+nlim = -1
+tlim = 0.1
+ndiag = 1000
+lat = true
+lat_levels = 2
+lat_same_level = true
+lat_same_level_max_ratio = 4
+hydro_lat_min_bin_count = 0
+
+<hydro>
+eos = ideal
+gamma = 1.6666666666666667
+reconstruct = plm
+rsolver = hllc
+dfloor = 1.0e-4
+pfloor = 1.0e-8
+
+<hydro_srcterms>
+self_gravity = true
+
+<gravity>
+four_pi_G = 1.0
+threshold = 1.0e-8
+mg_bc = multipole
+niteration = -1
+npresmooth = 2
+npostsmooth = 2
+full_multigrid = true
+fmg_ncycle = 1
+show_defect = false
+mg_nghost = 1
+rho_grav_min = 0.1
+solve_dt = 0.01
+
+<problem>
+pgen_name = tde_external
+user_srcs = true
+external_bh_gravity_source = true
+star_radius = 0.5
+poly_n = 1.5
+rho_floor = 1.0e-4
+relax_damp = false
+amp = 0.0
+use_translating_frame = true
+provide_params = true
+mass_ratio = 1.0
+x1 = -1.4
+y1 = 0.0
+z1 = 0.0
+vx1 = 0.0
+vy1 = 0.0
+vz1 = 0.0
+bh_live = true
+bh_reciprocal_force = true
+bh_pair_force = finite_difference
+bh_softening = 0.05
+bh_grav_rho_min = 0.1
+frame_rho_min = 0.1
+bh_excise_radius = 0.15
+bh_inner_boundary = true
+
+<output1>
+file_type = hst
+dt = 1.0e-8
+data_format = %24.16e
+
+<output2>
+file_type = bin
+variable = hydro_w
+dt = 0.05
+variable_precision = float64
+
+<output3>
+file_type = rst
+dt = 0.1

@@ -13,6 +13,8 @@
 // This version includes improvements due to Josh Dolence and the Parthenon dev team, and
 // extensions by J.M.Stone.
 
+#include <cstdlib>
+#include <cstddef>
 #include <iostream>
 #include <bitset>
 #include <functional>
@@ -24,7 +26,7 @@ class Driver;
 class Multigrid;
 
 // Maximum size of TL
-#define NUMBER_TASKID_BITS 64
+#define NUMBER_TASKID_BITS 128
 
 // constants = return codes for functions working on individual Tasks and TaskList
 enum class TaskStatus {fail, complete, incomplete};
@@ -158,13 +160,29 @@ class TaskList {
     return TaskListStatus::running;
   }
 
+  // Review A2/F11: AddTask does TaskID id(size+1) => std::bitset<NUMBER_TASKID_BITS>::
+  // set(size), which THROWS std::out_of_range at task number NUMBER_TASKID_BITS+1 in one
+  // list -- with no message and no rank context.  The fixed-GR "stagen" list with
+  // stage-coupled M1, canonical LAT FOFC and the two-temperature species path reaches 65
+  // to 66 tasks, so the width is 128 and this guard reports a list that outgrows it.
+  static void CheckTaskBudget(std::size_t size) {
+    if (size >= NUMBER_TASKID_BITS) {
+      std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                << std::endl << "a TaskList has reached its hard limit of "
+                << NUMBER_TASKID_BITS << " tasks (TaskID is a bitset of that width). "
+                << "Split the list or widen NUMBER_TASKID_BITS." << std::endl;
+      std::exit(EXIT_FAILURE);
+    }
+  }
+
   // ADD new Task with ID, given dependency, and a pointer to a static or non-member
   // function to the end of task list.  Returns ID of new task. Task function must have
   // arguments (Driver*, int). Usage:
   //     taskid = tl.AddTask(DoSomething, dependency, name);
   template <class F>
-  TaskID AddTask(F func, TaskID &dep) {
+  TaskID AddTask(F func, const TaskID &dep) {
     auto size = task_list_.size();
+    CheckTaskBudget(size);
     TaskID id(size+1);
     task_list_.push_back(
       Task(id, dep, [=](Driver *d, int s) mutable -> TaskStatus {return func(d,s);}));
@@ -176,8 +194,9 @@ class TaskList {
   // arguments (Driver*, int).  Usage:
   //     taskid = tl.AddTask(&T::DoSomething, T, dependency);
   template <class F, class T>
-  TaskID AddTask(F func, T *obj, TaskID &dep) {
+  TaskID AddTask(F func, T *obj, const TaskID &dep) {
     auto size = task_list_.size();
+    CheckTaskBudget(size);
     TaskID id(size+1);
     task_list_.push_back( Task(id, dep,
        [=](Driver *d, int s) mutable -> TaskStatus {return (obj->*func)(d,s);}) );
@@ -188,16 +207,18 @@ class TaskList {
   // list. Returns ID of new task. Task function must have arguments (Driver*, int).
   // Usage:
   //      taskid = tl.AddTask(DoSomething, dependency);
-  TaskID AddTask(std::function<TaskStatus(Driver*, int)> func, TaskID &dep) {
+  TaskID AddTask(std::function<TaskStatus(Driver*, int)> func, const TaskID &dep) {
     auto size = task_list_.size();
+    CheckTaskBudget(size);
     TaskID id(size+1);
     task_list_.push_back(Task(id, dep, func));
     return id;
   }
 
   template <class F, class T1>
-  TaskID AddTask(F func, T1 *obj, TaskID &dep, int mg) {
+  TaskID AddTask(F func, T1 *obj, const TaskID &dep, int mg) {
     auto size = task_list_.size();
+    CheckTaskBudget(size);
     TaskID id(size+1);
     task_list_.push_back( Task(id, dep,
        [=](Multigrid *d) mutable -> TaskStatus {return (obj->*func)(d);}) );
@@ -209,11 +230,12 @@ class TaskList {
   // or taskID(0) if location not found. Usage:
   //     taskid = tl.InsertTask(&T::DoSomething, T, dependency, location);
   template <class F, class T>
-  TaskID InsertTask(F func, T *obj, TaskID &dep, TaskID &loc) {
+  TaskID InsertTask(F func, T *obj, const TaskID &dep, TaskID &loc) {
     std::list<Task>::iterator it;
     for (it=task_list_.begin(); it!=task_list_.end(); ++it) {
       if (it->GetID() == loc) {
         auto size = task_list_.size();
+        CheckTaskBudget(size);
         TaskID id(size+1);
         auto old_dep = it->GetDependency();
         task_list_.insert(it, Task(id, dep,

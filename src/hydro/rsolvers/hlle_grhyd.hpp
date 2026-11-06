@@ -26,31 +26,30 @@ template <int ivx>
 KOKKOS_INLINE_FUNCTION
 void HLLE_GR(const EOS_Data &eos, const RegionIndcs &indcs,
              const DualArray1D<RegionSize> &size, const CoordData &coord,
-             const int m, const int k, const int j, const int i,
+             const int m, const int mb, const int k, const int j, const int i,
              const int is, const int js, const int ks,
              const DvceArray5D<Real> &wl,
              const DvceArray5D<Real> &wr,
-             const DvceArray5D<Real> &flx) {
+             const BandView5D<Real> &flx) {
   constexpr int ivy = IVX + ((ivx-IVX)+1)%3;
   constexpr int ivz = IVX + ((ivx-IVX)+2)%3;
   const Real gamma_prime = eos.gamma/(eos.gamma - 1.0);
-  auto &flat = coord.is_minkowski;
-  auto &spin = coord.bh_spin;
+  const KerrHole hole = coord.Hole();
 
 
   // Left/right primitives
-  Real wl_idn = wl(m,IDN,k,j,i);
-  Real wl_ivx = wl(m,ivx,k,j,i);
-  Real wl_ivy = wl(m,ivy,k,j,i);
-  Real wl_ivz = wl(m,ivz,k,j,i);
+  Real wl_idn = wl(mb,IDN,k,j,i);
+  Real wl_ivx = wl(mb,ivx,k,j,i);
+  Real wl_ivy = wl(mb,ivy,k,j,i);
+  Real wl_ivz = wl(mb,ivz,k,j,i);
 
-  Real wr_idn = wr(m,IDN,k,j,i);
-  Real wr_ivx = wr(m,ivx,k,j,i);
-  Real wr_ivy = wr(m,ivy,k,j,i);
-  Real wr_ivz = wr(m,ivz,k,j,i);
+  Real wr_idn = wr(mb,IDN,k,j,i);
+  Real wr_ivx = wr(mb,ivx,k,j,i);
+  Real wr_ivy = wr(mb,ivy,k,j,i);
+  Real wr_ivz = wr(mb,ivz,k,j,i);
 
-  Real wl_ipr = eos.IdealGasPressure(wl(m,IEN,k,j,i));
-  Real wr_ipr = eos.IdealGasPressure(wr(m,IEN,k,j,i));
+  Real wl_ipr = eos.IdealGasPressure(wl(mb,IEN,k,j,i));
+  Real wr_ipr = eos.IdealGasPressure(wr(mb,IEN,k,j,i));
 
   // Extract position of interface
   Real &x1min = size.d_view(m).x1min;
@@ -73,71 +72,62 @@ void HLLE_GR(const EOS_Data &eos, const RegionIndcs &indcs,
     x2v = CellCenterX(j-js, indcs.nx2, x2min, x2max);
     x3v = LeftEdgeX  (k-ks, indcs.nx3, x3min, x3max);
   }
-  Real glower[4][4], gupper[4][4];
-  ComputeMetricAndInverse(x1v, x2v, x3v, flat, spin, glower, gupper);
+  // The Cartesian Kerr-Schild metric is g = eta + f l l, so its null form (f, l_1, l_2,
+  // l_3) in place of glower[4][4]/gupper[4][4] keeps 4 live doubles in place of 32; every
+  // component used below is recovered exactly by the accessors in cartesian_ks.hpp (the
+  // same form as hlle_grmhd.hpp).
+  KSNullForm nf;
+  ComputeKSNullForm(x1v, x2v, x3v, hole, nf);
 
   // Calculate 4-velocity in left state (contravariant compt)
-  Real q = glower[ivx][ivx] * SQR(wl_ivx) + glower[ivy][ivy] * SQR(wl_ivy) +
-           glower[ivz][ivz] * SQR(wl_ivz) + 2.0*glower[ivx][ivy] * wl_ivx * wl_ivy +
-       2.0*glower[ivx][ivz] * wl_ivx * wl_ivz + 2.0*glower[ivy][ivz] * wl_ivy * wl_ivz;
+  // q = gamma_ij v^i v^j = |v|^2 + f (l_i v^i)^2
+  Real q = KSSpatialNormSq(nf, ivx, ivy, ivz, wl_ivx, wl_ivy, wl_ivz);
 
-  Real alpha = std::sqrt(-1.0/gupper[0][0]);
+  // alpha = sqrt(-1/g^{00}) with g^{00} = -(1+f)
+  Real alpha = KSAlpha(nf);
   Real gamma = sqrt(1.0 + q);
   Real uul[4];
   uul[0] = gamma / alpha;
-  uul[ivx] = wl_ivx - alpha * gamma * gupper[0][ivx];
-  uul[ivy] = wl_ivy - alpha * gamma * gupper[0][ivy];
-  uul[ivz] = wl_ivz - alpha * gamma * gupper[0][ivz];
+  Real ag = alpha * gamma;
+  uul[ivx] = wl_ivx - ag * KSGupper0i(nf, ivx);
+  uul[ivy] = wl_ivy - ag * KSGupper0i(nf, ivy);
+  uul[ivz] = wl_ivz - ag * KSGupper0i(nf, ivz);
 
   // lower vector indices (covariant compt)
   Real ull[4];
-  ull[0]   = glower[0][0]  *uul[0]   + glower[0][ivx]*uul[ivx] +
-             glower[0][ivy]*uul[ivy] + glower[0][ivz]*uul[ivz];
-
-  ull[ivx] = glower[ivx][0]  *uul[0]   + glower[ivx][ivx]*uul[ivx] +
-             glower[ivx][ivy]*uul[ivy] + glower[ivx][ivz]*uul[ivz];
-
-  ull[ivy] = glower[ivy][0]  *uul[0]   + glower[ivy][ivx]*uul[ivx] +
-             glower[ivy][ivy]*uul[ivy] + glower[ivy][ivz]*uul[ivz];
-
-  ull[ivz] = glower[ivz][0]  *uul[0]   + glower[ivz][ivx]*uul[ivx] +
-             glower[ivz][ivy]*uul[ivy] + glower[ivz][ivz]*uul[ivz];
+  KSLowerVec(nf, ivx, ivy, ivz, uul[0], uul[ivx], uul[ivy], uul[ivz],
+             ull[0], ull[ivx], ull[ivy], ull[ivz]);
 
   // Calculate 4-velocity in right state (contravariant compt)
-  q = glower[ivx][ivx] * SQR(wr_ivx) + glower[ivy][ivy] * SQR(wr_ivy) +
-      glower[ivz][ivz] * SQR(wr_ivz) + 2.0*glower[ivx][ivy] * wr_ivx * wr_ivy +
-      2.0*glower[ivx][ivz] * wr_ivx * wr_ivz + 2.0*glower[ivy][ivz] * wr_ivy * wr_ivz;
+  q = KSSpatialNormSq(nf, ivx, ivy, ivz, wr_ivx, wr_ivy, wr_ivz);
 
   gamma = sqrt(1.0 + q);
   Real uur[4];
   uur[0] = gamma / alpha;
-  uur[ivx] = wr_ivx - alpha * gamma * gupper[0][ivx];
-  uur[ivy] = wr_ivy - alpha * gamma * gupper[0][ivy];
-  uur[ivz] = wr_ivz - alpha * gamma * gupper[0][ivz];
+  ag = alpha * gamma;
+  uur[ivx] = wr_ivx - ag * KSGupper0i(nf, ivx);
+  uur[ivy] = wr_ivy - ag * KSGupper0i(nf, ivy);
+  uur[ivz] = wr_ivz - ag * KSGupper0i(nf, ivz);
 
   // lower vector indices (covariant compt)
   Real ulr[4];
-  ulr[0]   = glower[0][0]  *uur[0]   + glower[0][ivx]*uur[ivx] +
-             glower[0][ivy]*uur[ivy] + glower[0][ivz]*uur[ivz];
+  KSLowerVec(nf, ivx, ivy, ivz, uur[0], uur[ivx], uur[ivy], uur[ivz],
+             ulr[0], ulr[ivx], ulr[ivy], ulr[ivz]);
 
-  ulr[ivx] = glower[ivx][0]  *uur[0]   + glower[ivx][ivx]*uur[ivx] +
-             glower[ivx][ivy]*uur[ivy] + glower[ivx][ivz]*uur[ivz];
-
-  ulr[ivy] = glower[ivy][0]  *uur[0]   + glower[ivy][ivx]*uur[ivx] +
-             glower[ivy][ivy]*uur[ivy] + glower[ivy][ivz]*uur[ivz];
-
-  ulr[ivz] = glower[ivz][0]  *uur[0]   + glower[ivz][ivx]*uur[ivx] +
-             glower[ivz][ivy]*uur[ivy] + glower[ivz][ivz]*uur[ivz];
+  // Contravariant metric components entering the wavespeed solve
+  const Real gu00 = KSGupper00(nf);
+  const Real gu0x = KSGupper0i(nf, ivx);
+  const Real guxx = KSGupperij(nf, ivx, ivx);
 
   // Calculate wavespeeds in left state
   Real lp_l, lm_l;
-  eos.IdealGRHydroSoundSpeeds(wl_idn, wl_ipr, uul[0], uul[ivx], gupper[0][0],
-                              gupper[0][ivx], gupper[ivx][ivx], lp_l, lm_l);
+  eos.IdealGRHydroSoundSpeeds(wl_idn, wl_ipr, uul[0], uul[ivx], gu00, gu0x, guxx,
+                              lp_l, lm_l);
 
   // Calculate wavespeeds in right state
   Real lp_r, lm_r;
-  eos.IdealGRHydroSoundSpeeds(wr_idn, wr_ipr, uur[0], uur[ivx], gupper[0][0],
-                              gupper[0][ivx], gupper[ivx][ivx], lp_r, lm_r);
+  eos.IdealGRHydroSoundSpeeds(wr_idn, wr_ipr, uur[0], uur[ivx], gu00, gu0x, guxx,
+                              lp_r, lm_r);
 
   // Calculate extremal wavespeeds
   Real lambda_l = fmin(lm_l, lm_r);

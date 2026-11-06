@@ -133,7 +133,7 @@ TaskStatus OrbitalAdvectionFC::PackAndSendFC(DvceFaceFld4D<Real> &b) {
 
 #if MPI_PARALLEL_ENABLED
   // Send boundary buffer to neighboring MeshBlocks using MPI
-  Kokkos::fence();
+  DevExeSpace().fence();
   bool no_errors=true;
   for (int m=0; m<nmb; ++m) {
     for (int n=0; n<2; ++n) {
@@ -287,7 +287,6 @@ TaskStatus OrbitalAdvectionFC::RecvAndUnpackFC(DvceFaceFld4D<Real> &b0,
         break;
       case ReconstructionMethod::ppm4:
       case ReconstructionMethod::ppmx:
-      case ReconstructionMethod::teno:
       case ReconstructionMethod::wenoz:
         PPMX_RemapFlx(member, (jfs-joffset), (jfe+1-joffset), epsi, b0_, flx);
         break;

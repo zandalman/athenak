@@ -15,18 +15,20 @@
 namespace mhd {
 //----------------------------------------------------------------------------------------
 //! \fn LLF_GR<ivx>()
-//! \brief The LLF Riemann solver for GR MHD, single face (m,k,j,i).
-template <int ivx>
+//! \brief The LLF Riemann solver for GR MHD, single face (m,k,j,i), at the adiabatic
+//! index of each wall that the caller passes (see HLLE_GR).
+template <int ivx, bool capture_speeds = false>
 KOKKOS_INLINE_FUNCTION
 void LLF_GR(const EOS_Data &eos, const RegionIndcs &indcs,
             const DualArray1D<RegionSize> &size, const CoordData &coord,
-            const int m, const int k, const int j, const int i,
+            const int m, const int mb, const int k, const int j, const int i,
             const int is, const int js, const int ks,
             const DvceArray5D<Real> &wl, const DvceArray5D<Real> &wr,
             const DvceArray5D<Real> &bl, const DvceArray5D<Real> &br,
             const DvceArray4D<Real> &bx,
-            const DvceArray5D<Real> &flx,
-            const DvceArray4D<Real> &ey, const DvceArray4D<Real> &ez) {
+            const BandView5D<Real> &flx,
+            const BandView4D<Real> &ey, const BandView4D<Real> &ez,
+            const Real gamma_l, const Real gamma_r, Real *lambda_out = nullptr) {
   constexpr int ivy = IVX + ((ivx-IVX)+1)%3;
   constexpr int ivz = IVX + ((ivx-IVX)+2)%3;
   constexpr int iby = ((ivx-IVX) + 1)%3;
@@ -57,29 +59,35 @@ void LLF_GR(const EOS_Data &eos, const RegionIndcs &indcs,
 
   // Extract left/right primitives.  Note 1/2/3 always refers to x1/2/3 dirs
   MHDPrim1D wli,wri;
-  wli.d  = wl(m,IDN,k,j,i);
-  wli.vx = wl(m,ivx,k,j,i);
-  wli.vy = wl(m,ivy,k,j,i);
-  wli.vz = wl(m,ivz,k,j,i);
-  wli.by = bl(m,iby,k,j,i);
-  wli.bz = bl(m,ibz,k,j,i);
+  wli.d  = wl(mb,IDN,k,j,i);
+  wli.vx = wl(mb,ivx,k,j,i);
+  wli.vy = wl(mb,ivy,k,j,i);
+  wli.vz = wl(mb,ivz,k,j,i);
+  wli.by = bl(mb,iby,k,j,i);
+  wli.bz = bl(mb,ibz,k,j,i);
 
-  wri.d  = wr(m,IDN,k,j,i);
-  wri.vx = wr(m,ivx,k,j,i);
-  wri.vy = wr(m,ivy,k,j,i);
-  wri.vz = wr(m,ivz,k,j,i);
-  wri.by = br(m,iby,k,j,i);
-  wri.bz = br(m,ibz,k,j,i);
+  wri.d  = wr(mb,IDN,k,j,i);
+  wri.vx = wr(mb,ivx,k,j,i);
+  wri.vy = wr(mb,ivy,k,j,i);
+  wri.vz = wr(mb,ivz,k,j,i);
+  wri.by = br(mb,iby,k,j,i);
+  wri.bz = br(mb,ibz,k,j,i);
 
-  wli.e = wl(m,IEN,k,j,i);
-  wri.e = wr(m,IEN,k,j,i);
+  wli.e = wl(mb,IEN,k,j,i);
+  wri.e = wr(mb,IEN,k,j,i);
 
   // Extract normal magnetic field
   Real bxi = bx(m,k,j,i);
 
   // Call LLF solver on single interface state
   MHDCons1D flux;
-  SingleStateLLF_GRMHD(wli, wri, bxi, x1v, x2v, x3v, ivx, coord, eos, flux);
+  if constexpr (capture_speeds) {
+    SingleStateLLF_GRMHD<true>(wli, wri, bxi, x1v, x2v, x3v, ivx, coord, eos,
+                               gamma_l, gamma_r, flux, lambda_out);
+  } else {
+    SingleStateLLF_GRMHD(wli, wri, bxi, x1v, x2v, x3v, ivx, coord, eos,
+                         gamma_l, gamma_r, flux);
+  }
 
   // Store results in 3D array of fluxes
   flx(m,IDN,k,j,i) = flux.d;

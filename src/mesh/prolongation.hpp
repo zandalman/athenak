@@ -58,6 +58,65 @@ void ProlongCC(const int m, const int v, const int k, const int j, const int i,
 }
 
 //----------------------------------------------------------------------------------------
+//! \fn ProlongCCRatio()
+//! \brief Parent-ratio rule for a column that is conserved as D*q (the GR gas entropy
+//! D s, the species and two-temperature scalars D Y).  Min-mod prolongation of D and of
+//! D q separately gives a ratio q that no neighbour carries (a signed q, such as the log
+//! entropy, with a slope crossing zero gives any ratio).  ProlongCC has already filled
+//! the fine children of coarse cell (k,j,i); this resets column v of each child to
+//! D_child*q_child, with D_child the child's own prolongated density (a(m,vd)) and
+//! q_child the min-mod prolongation of the specific q = ca(v)/ca(vd) of the same
+//! stencil.  Where D is not positive and finite anywhere in the stencil the column is
+//! left as ProlongCC wrote it.
+
+KOKKOS_INLINE_FUNCTION
+void ProlongCCRatio(const int m, const int v, const int vd,
+                    const int k, const int j, const int i,
+                    const int fk, const int fj, const int fi,
+                    const bool multi_d, const bool three_d,
+                    const DvceArray5D<Real> &ca, const DvceArray5D<Real> &a) {
+  const int nj = multi_d ? 1 : 0;
+  const int nk = three_d ? 1 : 0;
+  // all stencil densities must be usable
+  const Real dc = ca(m,vd,k,j,i);
+  bool ok = (dc > 0.0) && Kokkos::isfinite(dc);
+  ok = ok && (ca(m,vd,k,j,i-1) > 0.0) && Kokkos::isfinite(ca(m,vd,k,j,i-1));
+  ok = ok && (ca(m,vd,k,j,i+1) > 0.0) && Kokkos::isfinite(ca(m,vd,k,j,i+1));
+  if (multi_d) {
+    ok = ok && (ca(m,vd,k,j-1,i) > 0.0) && Kokkos::isfinite(ca(m,vd,k,j-1,i));
+    ok = ok && (ca(m,vd,k,j+1,i) > 0.0) && Kokkos::isfinite(ca(m,vd,k,j+1,i));
+  }
+  if (three_d) {
+    ok = ok && (ca(m,vd,k-1,j,i) > 0.0) && Kokkos::isfinite(ca(m,vd,k-1,j,i));
+    ok = ok && (ca(m,vd,k+1,j,i) > 0.0) && Kokkos::isfinite(ca(m,vd,k+1,j,i));
+  }
+  if (!ok) return;
+  const Real q0 = ca(m,v,k,j,i)/dc;
+  if (!Kokkos::isfinite(q0)) return;
+  auto slope = [&](const Real ql, const Real qr) {
+    const Real dl = q0 - ql;
+    const Real dr = qr - q0;
+    return 0.125*(SIGN(dl) + SIGN(dr))*fmin(fabs(dl), fabs(dr));
+  };
+  const Real d1 = slope(ca(m,v,k,j,i-1)/ca(m,vd,k,j,i-1),
+                        ca(m,v,k,j,i+1)/ca(m,vd,k,j,i+1));
+  const Real d2 = multi_d ? slope(ca(m,v,k,j-1,i)/ca(m,vd,k,j-1,i),
+                                  ca(m,v,k,j+1,i)/ca(m,vd,k,j+1,i)) : 0.0;
+  const Real d3 = three_d ? slope(ca(m,v,k-1,j,i)/ca(m,vd,k-1,j,i),
+                                  ca(m,v,k+1,j,i)/ca(m,vd,k+1,j,i)) : 0.0;
+  if (!(Kokkos::isfinite(d1) && Kokkos::isfinite(d2) && Kokkos::isfinite(d3))) return;
+  for (int c3 = 0; c3 <= nk; ++c3) {
+    for (int c2 = 0; c2 <= nj; ++c2) {
+      for (int c1 = 0; c1 <= 1; ++c1) {
+        const Real q = q0 + (c1 ? d1 : -d1) + (c2 ? d2 : -d2) + (c3 ? d3 : -d3);
+        a(m,v,fk+c3,fj+c2,fi+c1) = a(m,vd,fk+c3,fj+c2,fi+c1)*q;
+      }
+    }
+  }
+  return;
+}
+
+//----------------------------------------------------------------------------------------
 //! \fn ProlongFCSharedX1Face()
 //! \brief 2nd-order (piecewise-linear) prolongation operator for face-centered variables
 //! on shared X1-faces between fine and coarse cells

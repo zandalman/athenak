@@ -89,6 +89,8 @@ class EOS : public EOSPolicy, public ErrorPolicy {
   using EOSPolicy::max_n;
   // Minimum density
   using EOSPolicy::min_n;
+  // Maximum number density of the gas entropy
+  using EOSPolicy::max_n_gas_entropy;
   // Maximum temperature
   using EOSPolicy::max_T;
   // Minimum temperature
@@ -125,6 +127,8 @@ class EOS : public EOSPolicy, public ErrorPolicy {
   using ErrorPolicy::max_bsq;
 
   static constexpr bool supports_entropy = std::is_base_of_v<SupportsEntropy, EOSPolicy>;
+  static constexpr bool supports_gas_entropy =
+      std::is_base_of_v<SupportsGasEntropy, EOSPolicy>;
   static constexpr bool supports_potentials =
     std::is_base_of_v<SupportsChemicalPotentials, EOSPolicy>;
 
@@ -195,6 +199,48 @@ class EOS : public EOSPolicy, public ErrorPolicy {
   KOKKOS_INLINE_FUNCTION Real GetPressure(Real n, Real T, Real *Y) const {
     return Pressure(n, T*code_units.TemperatureConversion(eos_units), Y) *
            eos_units.PressureConversion(code_units);
+  }
+
+  //! \fn bool HasGasEntropy()
+  //  \brief Whether this EOS labels its adiabats (SupportsGasEntropy), i.e. whether the
+  //         GR entropy fallback can transport and invert a gas entropy at all.
+  KOKKOS_INLINE_FUNCTION constexpr bool HasGasEntropy() const {
+    return supports_gas_entropy;
+  }
+
+  //! \fn Real GetGasEntropy(Real n, Real T, Real *Y)
+  //  \brief The adiabat label s(n, T) the GR entropy fallback transports as D s.
+  //
+  //  Constant along every solution of d eps = -p d(1/rho), so u^mu d_mu s = 0 in smooth
+  //  flow.  What it is per policy: KORAL's s = ln(p/rho^Gamma)/(Gamma-1) for the ideal gas
+  //  (koral_lite physics.c:1457-1475 over rho), the thermal adiabat for the cold+thermal
+  //  policies, the tabulated entropy per baryon for CompOSE, the adiabat label
+  //  L = ln eps_top for the LTE table (lte_eos::AdiabatLabel).  The label is in the
+  //  policy's units; only T is converted.  The ideal gas and the LTE table run with
+  //  eos_units == code_units, so theirs is the code-unit quantity.
+  //
+  //  \return s, or NaN for a policy without the hook.
+  KOKKOS_INLINE_FUNCTION Real GetGasEntropy(Real n, Real T, Real *Y) const {
+    if constexpr (supports_gas_entropy) {
+      return EOSPolicy::GasEntropy(n, T*code_units.TemperatureConversion(eos_units), Y);
+    } else {
+      return std::numeric_limits<Real>::quiet_NaN();
+    }
+  }
+
+  //! \fn Real GetTemperatureFromGasEntropy(Real n, Real s, Real *Y)
+  //  \brief The inverse of GetGasEntropy at fixed n.  Returns the EOS minimum
+  //  temperature where s lies at or below the EOS lower bound (the entropy root then
+  //  reports energy_at_minimum, a failure, as KORAL's -104), and a NaN where the policy
+  //  has no label at this n (the LTE table above its last density row).
+  KOKKOS_INLINE_FUNCTION Real GetTemperatureFromGasEntropy(Real n, Real s,
+                                                           Real *Y) const {
+    if constexpr (supports_gas_entropy) {
+      return EOSPolicy::TemperatureFromGasEntropy(n, s, Y)*
+             eos_units.TemperatureConversion(code_units);
+    } else {
+      return std::numeric_limits<Real>::quiet_NaN();
+    }
   }
 
   //! \fn Real GetEntropy(Real n, Real T, Real *Y)
@@ -520,6 +566,14 @@ class EOS : public EOSPolicy, public ErrorPolicy {
     return max_n;
   }
 
+  //! \brief Get the maximum number density (in EOS units) at which the inverse of the
+  //  gas entropy (GetTemperatureFromGasEntropy) is defined: max_n, or less where the
+  //  policy's label covers less density than its EOS (the LTE table, which has no label
+  //  above its last density row).
+  KOKKOS_INLINE_FUNCTION Real GetMaximumGasEntropyDensity() const {
+    return fmin(max_n, max_n_gas_entropy);
+  }
+
   //! \brief Get the minimum number density (in EOS units) permitted by the EOS.
   KOKKOS_INLINE_FUNCTION Real GetMinimumDensity() const {
     return min_n;
@@ -633,11 +687,19 @@ class EOS : public EOSPolicy, public ErrorPolicy {
     code_units = units;
   }
 
-  KOKKOS_INLINE_FUNCTION UnitSystem& GetCodeUnitSystem() const {
+  KOKKOS_INLINE_FUNCTION UnitSystem& GetCodeUnitSystem() {
     return code_units;
   }
 
-  KOKKOS_INLINE_FUNCTION UnitSystem& GetEOSUnitSystem() const {
+  KOKKOS_INLINE_FUNCTION const UnitSystem& GetCodeUnitSystem() const {
+    return code_units;
+  }
+
+  KOKKOS_INLINE_FUNCTION UnitSystem& GetEOSUnitSystem() {
+    return eos_units;
+  }
+
+  KOKKOS_INLINE_FUNCTION const UnitSystem& GetEOSUnitSystem() const {
     return eos_units;
   }
 };

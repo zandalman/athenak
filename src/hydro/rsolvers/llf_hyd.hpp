@@ -22,29 +22,29 @@ namespace hydro {
 template <int ivx>
 KOKKOS_INLINE_FUNCTION
 void LLF(const EOS_Data &eos,
-         const int m, const int k, const int j, const int i,
+         const int m, const int mb, const int k, const int j, const int i,
          const int is, const int js, const int ks,
          const DvceArray5D<Real> &wl,
          const DvceArray5D<Real> &wr,
-         const DvceArray5D<Real> &flx) {
+         const BandView5D<Real> &flx) {
   constexpr int ivy = IVX + ((ivx - IVX) + 1) % 3;
   constexpr int ivz = IVX + ((ivx - IVX) + 2) % 3;
 
 
   HydPrim1D wli, wri;
-  wli.d  = wl(m, IDN, k, j, i);
-  wli.vx = wl(m, ivx, k, j, i);
-  wli.vy = wl(m, ivy, k, j, i);
-  wli.vz = wl(m, ivz, k, j, i);
+  wli.d  = wl(mb, IDN, k, j, i);
+  wli.vx = wl(mb, ivx, k, j, i);
+  wli.vy = wl(mb, ivy, k, j, i);
+  wli.vz = wl(mb, ivz, k, j, i);
 
-  wri.d  = wr(m, IDN, k, j, i);
-  wri.vx = wr(m, ivx, k, j, i);
-  wri.vy = wr(m, ivy, k, j, i);
-  wri.vz = wr(m, ivz, k, j, i);
+  wri.d  = wr(mb, IDN, k, j, i);
+  wri.vx = wr(mb, ivx, k, j, i);
+  wri.vy = wr(mb, ivy, k, j, i);
+  wri.vz = wr(mb, ivz, k, j, i);
 
   if (eos.is_ideal) {
-    wli.e = wl(m, IEN, k, j, i);
-    wri.e = wr(m, IEN, k, j, i);
+    wli.e = wl(mb, IEN, k, j, i);
+    wri.e = wr(mb, IEN, k, j, i);
   }
 
   HydCons1D flux;

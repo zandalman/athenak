@@ -25,7 +25,7 @@
 #include "hydro/hydro.hpp"
 #include "mhd/mhd.hpp"
 #include "driver/driver.hpp"
-#include "pgen/pgen.hpp"
+#include "pgen.hpp"
 
 
 //----------------------------------------------------------------------------------------

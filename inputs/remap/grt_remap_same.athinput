@@ -1,0 +1,121 @@
+<comment>
+problem = remap battery: fixed-metric GR (kFixedGR) remap target, SAME mesh as
+inputs/remap/grt_source.athinput.  The gr_torus pgen needs ZERO remap code: the <remap>
+block below is picked up by remap::MaybeAutoRemap after UserProblem returns.
+`remap/source` is substituted by the battery (mirrors inputs/remap/mhd_remap.athinput).
+
+Gates (GT_same): div(B) at t0 and after 5 cycles, finiteness, and the relative L1 of rho
+between this run's t0 dump and the source run's final dump.
+
+<job>
+basename = GRTSame
+
+<mesh>
+nghost = 4
+nx1    = 48
+x1min  = -48.0
+x1max  = 48.0
+ix1_bc = user
+ox1_bc = user
+
+nx2    = 48
+x2min  = -48.0
+x2max  = 48.0
+ix2_bc = user
+ox2_bc = user
+
+nx3    = 48
+x3min  = -48.0
+x3max  = 48.0
+ix3_bc = user
+ox3_bc = user
+
+<meshblock>
+nx1 = 16
+nx2 = 16
+nx3 = 16
+
+<mesh_refinement>
+refinement = static
+num_levels = 2
+
+<refined_region0>
+# identical to the source: level-1 slots 2..3 = the central root block [-16,16]^3
+level = 1
+x1min = -12.0
+x1max = 0.0
+x2min = -12.0
+x2max = 0.0
+x3min = -12.0
+x3max = 0.0
+
+<time>
+evolution  = dynamic
+integrator = rk2
+cfl_number = 0.3
+# nlim is ABSOLUTE across a remap: remap.cpp adopts the SOURCE's ncycle, so this
+# is <grt_source.athinput ncycle = 30> + 5 = 35 post-remap cycles.
+nlim       = 35
+tlim       = 100000.0
+ndiag      = 1
+
+<coord>
+general_rel = true
+a           = 0.9375
+excise      = true
+dexcise     = 1.0e-10
+pexcise     = 0.333e-12
+
+<mhd>
+eos         = ideal
+reconstruct = ppm4
+rsolver     = hlle
+dfloor      = 1.0e-10
+pfloor      = 0.333e-12
+gamma       = 1.3333333333333333
+fofc        = true
+gamma_max   = 20.0
+
+<remap>
+enable          = true
+source          = replace_me.rst
+# GR classes resolve band_mode=auto to "keep": target cells outside the source domain
+# keep the pgen state instead of fading to the Newtonian floor state.
+band_mode       = auto
+transition_band = true
+# The source carries one static refinement level, so the FC (B) path must be allowed to
+# restrict B to the source ROOT grid.  Without this the loader fatals with
+# "MHD remap source has mesh refinement".
+b_coarsen_ok    = true
+b_report        = true
+# Source and target <outputN> blocks do not line up one-to-one (the source's output1 is a
+# restart, this run's output1 is a binary dump), and the carried-over last_time would only
+# confuse the file numbering the battery globs.  Keep the numbering local.
+copy_output_state = false
+
+<problem>
+fm_torus   = true
+r_edge     = 6.0
+r_peak     = 12.0
+tilt_angle = 0.0
+potential_beta_min = 100.0
+potential_cutoff   = 0.2
+potential_rho_pow  = 1.0
+rho_min   = 1.0e-5
+rho_pow   = -1.5
+pgas_min  = 0.333e-7
+pgas_pow  = -2.5
+rho_max   = 1.0
+l         = 0.0
+pert_amp  = 0.0
+user_hist = false
+
+<output1>
+file_type = bin
+variable  = mhd_divb
+dt        = 100000.0   # t0 (post-remap) dump + final Driver::Finalize dump
+
+<output2>
+file_type = bin
+variable  = mhd_w_bcc
+dt        = 100000.0

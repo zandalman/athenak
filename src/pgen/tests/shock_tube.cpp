@@ -91,7 +91,7 @@ void ProblemGenerator::ShockTube(ParameterInput *pin, const bool restart) {
     wl.vx = pin->GetReal("problem","ul");
     wl.vy = pin->GetReal("problem","vl");
     wl.vz = pin->GetReal("problem","wl");
-    wl.e  = (pin->GetReal("problem","pl"))/(eos.gamma - 1.0);
+    wl.e  = eos.HostInternalEnergyDensityFromRhoP(wl.d, pin->GetReal("problem","pl"));
     // compute Lorentz factor (needed for SR/GR)
     Real u0l = 1.0;
     if (pmbp->pcoord->is_special_relativistic || pmbp->pcoord->is_general_relativistic ||
@@ -108,7 +108,7 @@ void ProblemGenerator::ShockTube(ParameterInput *pin, const bool restart) {
     wr.vx = pin->GetReal("problem","ur");
     wr.vy = pin->GetReal("problem","vr");
     wr.vz = pin->GetReal("problem","wr");
-    wr.e  = (pin->GetReal("problem","pr"))/(eos.gamma - 1.0);
+    wr.e  = eos.HostInternalEnergyDensityFromRhoP(wr.d, pin->GetReal("problem","pr"));
     // compute Lorentz factor (needed for SR/GR)
     Real u0r = 1.0;
     if (pmbp->pcoord->is_special_relativistic || pmbp->pcoord->is_general_relativistic ||
@@ -182,9 +182,25 @@ void ProblemGenerator::ShockTube(ParameterInput *pin, const bool restart) {
     wl.vy = pin->GetReal("problem","vl");
     wl.vz = pin->GetReal("problem","wl");
     wl.e  = (pin->GetReal("problem","pl"))/(eos.gamma - 1.0);
-    wl.bx = pin->GetReal("problem","bxl");
-    wl.by = pin->GetReal("problem","byl");
-    wl.bz = pin->GetReal("problem","bzl");
+    // The field-free fluid (<hydro> with <adm>, MHD::HasField() false) is GRHD: B = 0,
+    // and its field arrays are one shared zero block that nothing writes, so the field
+    // keys are optional there and a nonzero one is refused.
+    const bool has_field = pmbp->pmhd->HasField();
+    auto field_key = [&](const char *name) {
+      if (has_field) return pin->GetReal("problem", name);
+      const Real b = pin->GetOrAddReal("problem", name, 0.0);
+      if (b != 0.0) {
+        std::cout << "### FATAL ERROR in " << __FILE__ << " at line " << __LINE__
+                  << std::endl << "<problem>/" << name << " = " << b << " on the "
+                  << "field-free fluid (<hydro> with <adm>), which carries no magnetic "
+                  << "field" << std::endl;
+        exit(EXIT_FAILURE);
+      }
+      return b;
+    };
+    wl.bx = field_key("bxl");
+    wl.by = field_key("byl");
+    wl.bz = field_key("bzl");
     // compute Lorentz factor (needed for SR/GR)
     Real u0l = 1.0;
     if (pmbp->pcoord->is_special_relativistic || pmbp->pcoord->is_general_relativistic ||
@@ -202,9 +218,9 @@ void ProblemGenerator::ShockTube(ParameterInput *pin, const bool restart) {
     wr.vy = pin->GetReal("problem","vr");
     wr.vz = pin->GetReal("problem","wr");
     wr.e  = (pin->GetReal("problem","pr"))/(eos.gamma - 1.0);
-    wr.bx = pin->GetReal("problem","bxr");
-    wr.by = pin->GetReal("problem","byr");
-    wr.bz = pin->GetReal("problem","bzr");
+    wr.bx = field_key("bxr");
+    wr.by = field_key("byr");
+    wr.bz = field_key("bzr");
     // compute Lorentz factor (needed for SR/GR)
     Real u0r = 1.0;
     if (pmbp->pcoord->is_special_relativistic || pmbp->pcoord->is_general_relativistic ||
@@ -257,6 +273,7 @@ void ProblemGenerator::ShockTube(ParameterInput *pin, const bool restart) {
         for (int r=0; r<nscal; ++r) {
           w0(m,IYF+r,k,j,i) = yl;
         }
+        if (!has_field) return;
         b0.x1f(m,k,j,i) = bxl;
         b0.x2f(m,k,j,i) = byl;
         b0.x3f(m,k,j,i) = bzl;
@@ -275,6 +292,7 @@ void ProblemGenerator::ShockTube(ParameterInput *pin, const bool restart) {
         for (int r=0; r<nscal; ++r) {
           w0(m,IYF+r,k,j,i) = yr;
         }
+        if (!has_field) return;
         b0.x1f(m,k,j,i) = bxr;
         b0.x2f(m,k,j,i) = byr;
         b0.x3f(m,k,j,i) = bzr;
@@ -377,3 +395,14 @@ void SetADMVariablesToSchwarzschild(MeshBlockPack *pmbp) {
 }
 
 } // namespace
+
+#if USER_PROBLEM_ENABLED
+//----------------------------------------------------------------------------------------
+//! \fn void ProblemGenerator::UserProblem()
+//! \brief Built as its own executable (an ATHENA_EXTRA_PROBLEMS entry, or -D PROBLEM),
+//! the built-in dispatch is compiled out and this generator is the user entry point.
+
+void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
+  ShockTube(pin, restart);
+}
+#endif

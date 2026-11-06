@@ -40,11 +40,11 @@ void RoeFluxIso(const Real wroe[], const Real du[], const Real wli[],
 template <int ivx>
 KOKKOS_INLINE_FUNCTION
 void Roe(const EOS_Data &eos,
-         const int m, const int k, const int j, const int i,
+         const int m, const int mb, const int k, const int j, const int i,
          const int is, const int js, const int ks,
          const DvceArray5D<Real> &wl,
          const DvceArray5D<Real> &wr,
-         const DvceArray5D<Real> &flx) {
+         const BandView5D<Real> &flx) {
   constexpr int ivy = IVX + ((ivx - IVX) + 1) % 3;
   constexpr int ivz = IVX + ((ivx - IVX) + 2) % 3;
 
@@ -57,19 +57,19 @@ void Roe(const EOS_Data &eos,
   Real ev[5], du[5];
 
   //--- Step 1.  Load L/R states (map the direction's velocity into the IVX slot)
-  wli[IDN] = wl(m, IDN, k, j, i);
-  wli[IVX] = wl(m, ivx, k, j, i);
-  wli[IVY] = wl(m, ivy, k, j, i);
-  wli[IVZ] = wl(m, ivz, k, j, i);
+  wli[IDN] = wl(mb, IDN, k, j, i);
+  wli[IVX] = wl(mb, ivx, k, j, i);
+  wli[IVY] = wl(mb, ivy, k, j, i);
+  wli[IVZ] = wl(mb, ivz, k, j, i);
 
-  wri[IDN] = wr(m, IDN, k, j, i);
-  wri[IVX] = wr(m, ivx, k, j, i);
-  wri[IVY] = wr(m, ivy, k, j, i);
-  wri[IVZ] = wr(m, ivz, k, j, i);
+  wri[IDN] = wr(mb, IDN, k, j, i);
+  wri[IVX] = wr(mb, ivx, k, j, i);
+  wri[IVY] = wr(mb, ivy, k, j, i);
+  wri[IVZ] = wr(mb, ivz, k, j, i);
 
   if (eos.is_ideal) {
-    wli[IEN] = eos.IdealGasPressure(wl(m, IEN, k, j, i));
-    wri[IEN] = eos.IdealGasPressure(wr(m, IEN, k, j, i));
+    wli[IEN] = eos.IdealGasPressure(wl(mb, IEN, k, j, i));
+    wri[IEN] = eos.IdealGasPressure(wr(mb, IEN, k, j, i));
   }
 
   //--- Step 2.  Roe-averaged data

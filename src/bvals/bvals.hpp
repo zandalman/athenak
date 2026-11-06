@@ -16,17 +16,70 @@
 enum BoundaryFace {undef=-1, inner_x1, outer_x1, inner_x2, outer_x2, inner_x3, outer_x3};
 
 // identifiers for boundary conditions
+// outflow_only: zero-gradient outflow wherever the gas next to the face leaves the domain,
+// and a reflecting wall wherever it would flow in, so that no mass enters through the face
 enum class BoundaryFlag {undef=-1,block, reflect, inflow, outflow, diode, user, periodic,
-                         shear_periodic, vacuum, mg_zerograd, mg_zerofixed,
-                         mg_multipole};
+                         shear_periodic, vacuum, mg_zerograd, mg_zerofixed, mg_multipole,
+                         outflow_only};
+
+//! Whether the generic physical boundary kernels (MeshBoundaryValues::HydroBCs and
+//! BFieldBCs) have a case for a mesh face of this flag.  They do nothing on a periodic
+//! face and on a user face, whose ghosts the problem generator's boundary function sets,
+//! so a direction whose faces both have no case needs no launch.
+inline bool HasGenericPhysicalBC(const BoundaryFlag flag) {
+  return flag == BoundaryFlag::reflect || flag == BoundaryFlag::inflow ||
+         flag == BoundaryFlag::outflow || flag == BoundaryFlag::diode ||
+         flag == BoundaryFlag::vacuum || flag == BoundaryFlag::outflow_only;
+}
+
+//! Whether a mesh face of this flag is a physical (boundary-condition) face, whose ghost
+//! cells a boundary condition has just replaced, as opposed to a communication,
+//! periodic or shear-periodic face.
+KOKKOS_INLINE_FUNCTION
+bool IsPhysicalBoundaryFlag(const BoundaryFlag flag) {
+  return flag != BoundaryFlag::block && flag != BoundaryFlag::periodic &&
+         flag != BoundaryFlag::shear_periodic && flag != BoundaryFlag::undef;
+}
+
+//! Is (k,j,i) a ghost cell of a physical face of MeshBlock m, outside the owned box
+//! [ks,ke] x [js,je] x [is,ie]?
+template <typename BoundaryView>
+KOKKOS_INLINE_FUNCTION
+bool IsPhysicalBoundaryGhost(
+    const BoundaryView &mb_bcs, const int m,
+    const int k, const int j, const int i,
+    const int ks, const int ke, const int js, const int je,
+    const int is, const int ie) {
+  if (i < is && IsPhysicalBoundaryFlag(mb_bcs(m,BoundaryFace::inner_x1))) return true;
+  if (i > ie && IsPhysicalBoundaryFlag(mb_bcs(m,BoundaryFace::outer_x1))) return true;
+  if (j < js && IsPhysicalBoundaryFlag(mb_bcs(m,BoundaryFace::inner_x2))) return true;
+  if (j > je && IsPhysicalBoundaryFlag(mb_bcs(m,BoundaryFace::outer_x2))) return true;
+  if (k < ks && IsPhysicalBoundaryFlag(mb_bcs(m,BoundaryFace::inner_x3))) return true;
+  return k > ke && IsPhysicalBoundaryFlag(mb_bcs(m,BoundaryFace::outer_x3));
+}
+
+//! identifiers for status of MPI boundary communications
+enum class BoundaryStatus {waiting, arrived, completed};
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
+#include <limits>
+#include <string>
+#include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 #include "athena.hpp"
+#include "globals.hpp"
+#include "utils/mpi_buffer_pool.hpp"
 #include "mesh/mesh.hpp"
 #include "coordinates/coordinates.hpp"
 #include "tasklist/task_list.hpp"
+#include "utils/device_args.hpp"
 //#include "particles/particles.hpp"
 
 // Forward declarations
@@ -45,6 +98,86 @@ inline int CreateBvals_MPI_Tag(int lid, int bufid) {
 }
 
 //----------------------------------------------------------------------------------------
+//! \struct LATSendSpan
+//! \brief Where in time one LAT send edge places its sender's state (PackAndSendCC/FC):
+//! pending, the sender's Euler chord y0 + extrap*(y1 - y0) (LATExtrapolateCC); history,
+//! the sender's step history at theta in [0,1] (LATInterpolateCC); else the sender's
+//! current state.  theta_raw is theta before the clamp.
+struct LATSendSpan {
+  bool pending = false;
+  bool history = false;
+  Real extrap = 1.0;
+  Real theta = 0.0;
+  Real theta_raw = 0.0;
+};
+
+//----------------------------------------------------------------------------------------
+//! \fn LATSendSpan LATSendEdgeSpan
+//! \brief The time placement of the send edge (sender m, receiver of factor nf).
+//!
+//! A refresh publishes for one target_time.  The union corrector refresh
+//! (MeshBlockPack::lat_union_refresh) publishes for every due block at once, each at the
+//! endpoint of its own predictor step: the edge's target is start + fine_dt*nf.  Every
+//! due block is active there.  A due sender of factor sf publishes its Euler endpoint
+//! itself to a receiver of its own factor, and otherwise the chord
+//! u(t) + (nf/sf)(u_E - u(t)) = u(t) + nf*fine_dt*L(u(t)), which is exactly the stage
+//! value global Heun of step nf*fine_dt holds in the sender's cells, so the receiver's
+//! corrector stays second order.  For nf > sf that is the pending extrapolation of the
+//! factor cadence (the same arithmetic, the same target); for nf < sf it is a convex
+//! interpolation of two states the sender holds, so every bounded component stays
+//! bounded.  A sender not due interpolates its history at the edge's target, as for a
+//! factor refresh of the receiver's factor.  `interpolates` false (a pack with no time
+//! axis) leaves the ratios at their defaults.
+KOKKOS_INLINE_FUNCTION
+LATSendSpan LATSendEdgeSpan(const bool lat_enabled, const bool interpolates,
+                            const int active, const int factor, const int pending_below,
+                            const Real t0, const Real t1, const Real target_time,
+                            const bool union_refresh, const Real union_start,
+                            const Real union_fine_dt, const int receiver_factor) {
+  LATSendSpan s;
+  const bool inactive = lat_enabled && active == 0;
+  const bool union_chord = union_refresh && lat_enabled && !inactive &&
+                           factor != receiver_factor;
+  s.pending = (inactive && pending_below > 1 && factor < pending_below) || union_chord;
+  s.history = inactive && !s.pending && t1 > t0;
+  if (!interpolates || !(t1 > t0)) return s;
+  const Real target = union_refresh ?
+      (union_start + union_fine_dt*static_cast<Real>(receiver_factor)) : target_time;
+  if (s.pending) s.extrap = (target - t0)/(t1 - t0);
+  if (s.history) {
+    s.theta_raw = (target - t0)/(t1 - t0);
+    s.theta = fmax(static_cast<Real>(0.0), fmin(static_cast<Real>(1.0), s.theta_raw));
+  }
+  return s;
+}
+
+//----------------------------------------------------------------------------------------
+//! \struct LATPendingBound
+//! \brief What a LAT pending sender's extrapolation must keep (PackAndSendCC,
+//! LATExtrapolateCC).
+//!
+//! - var: components that must stay positive (a fluid's density and energy, a radiation
+//!   field's energy and number); a cell where one does not publishes the sender's own
+//!   Euler endpoint in every component.
+//! - ratio_begin..ratio_end-1: per-mass columns (passive scalars D Y, the GR gas entropy
+//!   D s), published as the extrapolated D (component idn) times the endpoint's ratio.
+
+struct LATPendingBound {
+  static constexpr int kMaxVars = 8;
+  int nvar = 0;
+  int var[kMaxVars] = {};
+  int idn = 0, ratio_begin = 0, ratio_end = 0;
+  void Add(const int v) {
+    if (nvar == kMaxVars) {
+      std::fprintf(stderr, "### FATAL ERROR: LATPendingBound holds at most %d "
+                   "components\n", kMaxVars);
+      std::exit(EXIT_FAILURE);
+    }
+    var[nvar++] = v;
+  }
+};
+
+//----------------------------------------------------------------------------------------
 //! \struct BufferIndcs
 //! \brief indices for range of cells packed/unpacked into boundary buffers
 
@@ -53,6 +186,13 @@ struct MeshBufferIndcs {
   MeshBufferIndcs() :
     bis(0), bie(0), bjs(0), bje(0), bks(0), bke(0) {}
 };
+
+//----------------------------------------------------------------------------------------
+//! \enum FluxFootprint
+//! \brief storage a flux payload needs: none (a 1x1 stub, the payload is never read or
+//! written), coarse (fine-to-coarse only, iflxc_ndat), or full (also same-level LAT
+//! payloads, max(iflxs_ndat, iflxc_ndat)).  See MeshBoundaryValues::SendFluxFootprint.
+enum class FluxFootprint {none, coarse, full};
 
 //----------------------------------------------------------------------------------------
 //! \struct MeshBoundaryBuffer
@@ -73,8 +213,10 @@ struct MeshBoundaryBuffer {
   MeshBufferIndcs isame_z4c;  // indices for pack/unpack with z4c when dst/src at same lvl
 
   // Maximum number of data elements (bie-bis+1) across 3 components of above
-  int isame_ndat, isame_z4c_ndat, icoar_ndat, ifine_ndat, iflxs_ndat, iflxc_ndat;
-
+  // Zero until the owner's Init*Indices writes them, so a slot no owner ever fills
+  // sizes nothing rather than sizing from whatever the allocation happened to hold.
+  int isame_ndat = 0, isame_z4c_ndat = 0, icoar_ndat = 0, ifine_ndat = 0;
+  int iflxs_ndat = 0, iflxc_ndat = 0;
   // 2D Views that store buffer data on device, dimensioned (nmb, ndata)
   DvceArray2D<Real> vars, flux;
 
@@ -86,23 +228,81 @@ struct MeshBoundaryBuffer {
 
   // function to allocate memory for buffers for variables and their fluxes
   // Must only be called after BufferIndcs above are initialized
-  void AllocateBuffers(int nmb, int nvars, bool is_z4c) {
-    // With Z4c, buffers may contain BOTH same and coarse data
-    if (is_z4c) {
+  void AllocateBuffers(int nmb, int nvars, int nfluxvars, bool is_z4c,
+                       bool stub_vars = false,
+                       FluxFootprint flux_footprint = FluxFootprint::full,
+                       bool no_same_vars = false, bool same_only_vars = false) {
+    if (stub_vars || no_same_vars) {
+      // The owner guarantees this buffer's vars payload is never read or written
+      // (see MeshBoundaryValues::stub_send_vars and stub_recv_same_vars).
+      Kokkos::realloc(vars, 1, 1);
+    } else if (same_only_vars) {
+      // The owner guarantees this buffer only ever carries a SAME-level payload, so
+      // the coarse and fine footprints are dead storage.  See
+      // MeshBoundaryValues::same_level_vars_only.
+      Kokkos::realloc(vars, nmb, (nvars*isame_ndat));
+    } else if (is_z4c) {
+      // With Z4c, buffers may contain BOTH same and coarse data
       int nmax = std::max(isame_z4c_ndat, std::max(icoar_ndat, ifine_ndat) );
       Kokkos::realloc(vars, nmb, (nvars*nmax));
     } else {
       int nmax = std::max(isame_ndat, std::max(icoar_ndat, ifine_ndat) );
       Kokkos::realloc(vars, nmb, (nvars*nmax));
     }
-    int nmax = std::max(iflxs_ndat, iflxc_ndat);
-    Kokkos::realloc(flux, nmb, (nvars*nmax));
+    AllocateFlux(nmb, nfluxvars, flux_footprint);
+  }
+
+  // (Re)allocate the flux payload at the footprint the owner guarantees.  Neither payload
+  // is ever handed to MPI: the legacy flux exchange stages its off-rank messages through
+  // compact pooled buffers (MeshBoundaryValues::PostLegacyFluxSends/Recvs), so both are
+  // ordinary allocations, freed on regrow.
+  void AllocateFlux(int nmb, int nfluxvars, FluxFootprint flux_footprint) {
+    if (flux_footprint == FluxFootprint::none) {
+      Kokkos::realloc(flux, 1, 1);
+    } else {
+      const int nmax = (flux_footprint == FluxFootprint::coarse) ?
+                       iflxc_ndat : std::max(iflxs_ndat, iflxc_ndat);
+      Kokkos::realloc(flux, nmb, (nfluxvars*nmax));
+    }
   }
 };
 
 //----------------------------------------------------------------------------------------
+//! \struct MeshBoundaryBufferDevice
+//! \brief lightweight device metadata and non-owning access to one boundary buffer
+
+struct MeshBufferIndcsDevice {
+  int bis,bie,bjs,bje,bks,bke;
+};
+
+struct MeshBufferDataDevice {
+  Real *data;
+  std::size_t stride0;
+
+  KOKKOS_INLINE_FUNCTION
+  Real &operator()(const int m, const int n) const {
+    return data[static_cast<std::size_t>(m)*stride0 + static_cast<std::size_t>(n)];
+  }
+};
+
+struct MeshBoundaryBufferDevice {
+  MeshBufferIndcsDevice isame[3];
+  MeshBufferIndcsDevice icoar[3];
+  MeshBufferIndcsDevice ifine[3];
+  MeshBufferIndcsDevice iprol[3];
+  MeshBufferIndcsDevice iflux_same[3];
+  MeshBufferIndcsDevice iflux_coar[3];
+  MeshBufferIndcsDevice isame_z4c;
+  int isame_ndat, isame_z4c_ndat, icoar_ndat, ifine_ndat, iflxs_ndat, iflxc_ndat;
+  MeshBufferDataDevice vars, flux;
+};
+
+static_assert(std::is_trivially_default_constructible_v<MeshBoundaryBufferDevice>);
+static_assert(std::is_trivially_copyable_v<MeshBoundaryBufferDevice>);
+
+//----------------------------------------------------------------------------------------
 //! \struct RankPackedVarEntry
-//! \brief metadata for one (MeshBlock,neighbor) var-payload in a rank-packed message
+//! \brief metadata for one off-rank (MeshBlock, neighbor) boundary payload
 
 struct RankPackedVarEntry {
   int m;
@@ -115,7 +315,7 @@ struct RankPackedVarEntry {
 
 //----------------------------------------------------------------------------------------
 //! \struct RankPackedVarMessage
-//! \brief metadata for one aggregated MPI vars message between ranks
+//! \brief metadata for one aggregate boundary message to or from a rank
 
 struct RankPackedVarMessage {
   int rank;
@@ -125,6 +325,219 @@ struct RankPackedVarMessage {
   int offset;
   int data_size;
 };
+
+#if MPI_PARALLEL_ENABLED
+//----------------------------------------------------------------------------------------
+//! Granularity of the rank-packed aggregate payload buffers: one MiB of Reals.
+//!
+//! These buffers are sized from the off-rank payload total, which AMR moves by a handful
+//! of entries on essentially every cycle.  Reallocating them to the exact total churned
+//! tens of MiB of device memory per cycle for a change of a few KiB.  Rounding the
+//! capacity up to a whole MiB and growing only turns that into a handful of allocations
+//! for a whole run.  See mesh/mb_storage.hpp for the block-sized version of this policy.
+constexpr std::size_t kRankPackedBufGrainReals =
+    static_cast<std::size_t>(1024*1024)/sizeof(Real);
+
+//----------------------------------------------------------------------------------------
+//! \fn int RankPackedBufCapacity(int nreal_needed)
+//! \brief number of Reals to allocate in order to hold nreal_needed of them
+//!
+//! Never returns zero: the aggregate buffers are constructed with extent 1 and their
+//! .data() is taken unconditionally, so an empty allocation would be a change in behavior
+//! for a rank with no off-rank partners.
+
+inline int RankPackedBufCapacity(const int nreal_needed) {
+  const int n = std::max(nreal_needed, 1);
+  const int grain = static_cast<int>(kRankPackedBufGrainReals);
+  // Cannot round up without overflowing the extent (a >16 GiB payload on one rank); ask
+  // for exactly what is needed and let the allocation itself report the failure.
+  if (n > (std::numeric_limits<int>::max() - (grain - 1))) return n;
+  return ((n + grain - 1)/grain)*grain;
+}
+
+//! Capacity for a rank-packed buffer that must grow to hold `need` Reals: sized for the
+//! block budget (mpi_buffer_pool::GrowTarget), then rounded as RankPackedBufCapacity.
+inline int RankPackedGrowCapacity(const int need, const int nmb_this, const int nmb_max,
+                                  const bool first = false) {
+  const std::size_t t = mpi_buffer_pool::GrowTarget(
+      static_cast<std::size_t>(std::max(need, 1)), nmb_this, nmb_max, first);
+  return RankPackedBufCapacity(static_cast<int>(
+      std::min<std::size_t>(t, static_cast<std::size_t>(std::numeric_limits<int>::max()))));
+}
+
+//! Pooled rank-packed buffer holding at least `need` Reals; a new allocation is sized for
+//! the block budget, a free pooled buffer that already holds `need` is reused.
+inline DvceArray1D<Real> AcquireRankPacked(const int need, const int nmb_this,
+                                           const int nmb_max, const bool zero = false,
+                                           const bool first = false) {
+  return mpi_buffer_pool::Acquire1D<Real>(
+      static_cast<std::size_t>(RankPackedBufCapacity(need)), zero,
+      static_cast<std::size_t>(RankPackedGrowCapacity(need, nmb_this, nmb_max, first)));
+}
+
+//----------------------------------------------------------------------------------------
+//! \struct LegacyFluxMsg
+//! \brief one message of the legacy (per-neighbour) flux exchange: row m of slot n's flux
+//! payload, data_size Reals to or from `rank` with `tag`, staged at `offset`
+
+struct LegacyFluxMsg {
+  int m;
+  int n;
+  int rank;
+  int tag;
+  int data_size;
+  int offset;
+};
+
+//----------------------------------------------------------------------------------------
+//! \struct LegacyFluxStage
+//! \brief one direction of the legacy flux exchange, staged through a compact buffer
+//!
+//! MPI used to send from and receive into rows of the per-neighbour flux payloads
+//! (MeshBoundaryBuffer::flux), one allocation per neighbour slot covering every block.
+//! A rendezvous message over UCX cuda_ipc maps the whole allocation into the peer, so a
+//! regrown payload stayed alive after it was freed.  The messages now travel through
+//! `buf`, which holds only this rank's off-rank payloads back to back, comes from
+//! mpi_buffer_pool and only grows; the payloads themselves never reach MPI.
+
+struct LegacyFluxStage {
+  std::vector<LegacyFluxMsg> msgs;   // this phase's messages, in posting order
+  int total = 0;                     // Reals in msgs
+  std::vector<int> table_h;          // (m, n, offset, data_size) per message, as uploaded
+  std::vector<int> table_scratch;    // the same for the current msgs, before comparison
+  DvceArray1D<int> table;            // device copy of table_h, read by the copy kernel
+  DvceArray1D<Real> buf;             // compact payloads, pooled, grow-only
+  void Clear() {
+    msgs.clear();
+    total = 0;
+  }
+  void Add(int m, int n, int rank, int tag, int data_size) {
+    msgs.push_back(LegacyFluxMsg{m, n, rank, tag, data_size, total});
+    total += data_size;
+  }
+};
+
+//----------------------------------------------------------------------------------------
+//! \struct LATOffsetPool
+//! \brief pooled row storage for the two nmb*nnghbr offset maps every LAT layout needs
+//!
+//! Each layout used to allocate its own pair of device int views, and a few layouts are
+//! built per cycle because the topology version changes about that often.  Rows of one
+//! persistent allocation are handed out instead, so a layout costs no allocation at all.
+//!
+//! The pool is reshaped ONLY when row 0 is requested, i.e. when the layout vector has
+//! just been emptied and no layout holds a row, so a row that a layout -- or a kernel
+//! that captured it -- is still using can never move.  Rows past the end of the pool fall
+//! back to their own allocation exactly as before and the pool catches up at the next
+//! reset, which keeps the policy correct for any number of layouts.
+//!
+//! Rows are handed out uninitialized: every caller fills a full-length host mirror and
+//! deep_copies the whole row before anything reads it.
+
+//! Rows reserved on the first reshape, so the usual handful of layouts is covered without
+//! waiting for the high-water count to catch up.  One row is nmb*nnghbr ints, ~52 KiB at
+//! 231 blocks and 56 neighbors.
+constexpr int kLATOffsetPoolMinRows = 8;
+
+struct LATOffsetPool {
+  DvceArray2D<int> rows;
+  int want_rows = 0;   // high-water row count; applied the next time row 0 is requested
+
+  //! \brief row `row` of the pool as a contiguous map of `len` ints
+  DvceArray1D<int> Acquire(const char *label, const int row, const int len) {
+    want_rows = std::max(want_rows, row + 1);
+    if ((row == 0) &&
+        ((rows.extent_int(0) < want_rows) || (rows.extent_int(1) != len))) {
+      rows = DvceArray2D<int>(
+          Kokkos::view_alloc(Kokkos::WithoutInitializing, "lat_offset_pool"),
+          std::max(want_rows, kLATOffsetPoolMinRows), len);
+    }
+    if ((row < rows.extent_int(0)) && (rows.extent_int(1) == len)) {
+      return Kokkos::subview(rows, row, Kokkos::make_pair(0, len));
+    }
+    // Kokkos only accepts a label as std::string or a character array, never a pointer.
+    return DvceArray1D<int>(std::string(label), len);
+  }
+};
+
+// Cached LAT masks are immutable, but their allocations can be recycled after AMR or a
+// scheduling change.  The MeshBlockPack generation makes the pointer pair a stable,
+// collision-free key across those cache lifetimes.
+struct LATLayoutCacheKey {
+  std::uint64_t generation;
+  std::uintptr_t first_mask;
+  std::uintptr_t second_mask;
+
+  bool operator==(const LATLayoutCacheKey &other) const {
+    return generation == other.generation && first_mask == other.first_mask &&
+           second_mask == other.second_mask;
+  }
+};
+
+struct LATLayoutCacheKeyHash {
+  std::size_t operator()(const LATLayoutCacheKey &key) const {
+    const std::size_t generation_hash = std::hash<std::uint64_t>{}(key.generation);
+    const std::size_t first_hash = std::hash<std::uintptr_t>{}(key.first_mask);
+    const std::size_t second_hash = std::hash<std::uintptr_t>{}(key.second_mask);
+    return generation_hash ^ (first_hash << 1) ^ (second_hash << 2);
+  }
+};
+
+// A LAT layout is a compact, exact subset of the immutable rank-packed topology.
+// Keeping the selected entry IDs makes cache lookup collision-free.
+struct RankPackedVarLayout {
+  std::uint64_t topology_version;
+  std::uint64_t lat_metadata_version;
+  std::uint64_t selection_hash;
+  std::vector<int> send_entry_ids;
+  std::vector<int> recv_header_ids;
+  std::vector<RankPackedVarMessage> send_msgs;
+  std::vector<RankPackedVarMessage> recv_msgs;
+#if MPI_PARALLEL_ENABLED
+  // Persistent MPI_Send_init/MPI_Recv_init handles bound to send_msgs/recv_msgs and to
+  // the aggregate payload buffers.  They live with the layout because a layout IS the
+  // (peer, offset, count) tuple set: the dense path has one such set and each LAT mask
+  // selection has its own.  Created on first use; freed wherever lat_var_layouts_ is
+  // cleared, which is exactly where the offsets they encode stop being valid.
+  std::vector<MPI_Request> send_preqs;
+  std::vector<MPI_Request> recv_preqs;
+#endif
+  DvceArray1D<int> send_offsets;
+  DvceArray1D<int> recv_offsets;
+  // Pool row backing send_offsets; recv_offsets is the next row.  -1 when the maps were
+  // never assigned.  The row is 2*(index in the layout vector), which is why the pool can
+  // only ever be reshaped while that vector is empty.
+  int offsets_row = -1;
+};
+
+//! \struct RankPackedFluxLayout
+//! \brief exact LAT subset of off-rank flux payloads, grouped by peer
+
+struct RankPackedFluxLayout {
+  std::uint64_t topology_version;
+  std::uint64_t lat_metadata_version;
+  std::uint64_t selection_hash;
+  bool integrated;
+  std::vector<int> send_entry_ids;
+  std::vector<int> recv_entry_ids;
+  std::vector<RankPackedVarMessage> send_msgs;
+  std::vector<RankPackedVarMessage> recv_msgs;
+  // Persistent MPI_Send_init/MPI_Recv_init handles, exactly as in RankPackedVarLayout:
+  // bound to send_msgs/recv_msgs and to rank_sendbuf_flux_/rank_recvbuf_flux_.  A LAT
+  // bin-step re-posts the identical (peer, offset, count) tuples every time, so the one
+  // registration these hold replaces a fresh MPI_Isend/MPI_Irecv per phase -- which, with
+  // UCX_RCACHE_ENABLE=n, re-registered the GPU buffer on every call.  Created on first
+  // use; freed wherever lat_flux_layouts_ is cleared, i.e. exactly where the offsets they
+  // encode stop being valid.
+  std::vector<MPI_Request> send_preqs;
+  std::vector<MPI_Request> recv_preqs;
+  DvceArray1D<int> send_offsets;
+  DvceArray1D<int> recv_offsets;
+  // Pool row backing send_offsets, as in RankPackedVarLayout.  Stays -1 for the
+  // face-centered owner, which has not been moved onto the pool.
+  int offsets_row = -1;
+};
+#endif
 
 // Forward declarations
 class MeshBlockPack;
@@ -142,6 +555,49 @@ class MeshBoundaryValues {
   // However each MeshBoundaryBuffer is lightweight, so the convenience of fixed array
   // sizes and index values for array elements outweighs cost of extra memory.
   MeshBoundaryBuffer sendbuf[56], recvbuf[56];
+  DvceArray1D<MeshBoundaryBufferDevice> sendbuf_device, recvbuf_device;
+
+  // Owners whose exchanges go exclusively through the standard PackAndSend*/
+  // RecvAndUnpack* machinery may set this before InitializeBuffers to stub the
+  // send-side per-neighbor vars payloads when nranks>1: the rank-packed path
+  // (always active there for CC/FC) packs off-rank data into the aggregate
+  // buffers and writes same-rank payloads directly into the destination
+  // recvbuf, so sendbuf vars are never touched.  The receive side is governed by
+  // stub_recv_same_vars below.
+  // MultigridBoundaryValues packs and Isends from sendbuf vars and must NOT
+  // set this.  Flux payloads are unaffected.
+  bool stub_send_vars = false;
+  // Receive-side companion of stub_send_vars: on multi-rank runs the rank-packed path
+  // writes same-rank same-level payloads straight into the destination array,
+  // off-rank payloads into the rank aggregate, and same-rank cross-level (coarse/fine)
+  // payloads into local_xlev_vars_, one region per receiving (block, neighbour) that
+  // actually has such a neighbour.  recvbuf[n].vars is then never touched, so owners
+  // that opt in stub every recv slot instead of reserving a cross-level footprint in all
+  // 56 slots of every block.  Only MeshBoundaryValuesCC exchanges honour it.
+  bool stub_recv_same_vars = false;
+  // The mirror image of the two flags above: owners that exchange nothing BUT same-level
+  // payloads size their vars buffers from isame_ndat alone instead of the maximum over
+  // isame/icoar/ifine.  MultigridBoundaryValues packs its own buffers and never sends
+  // cross-level data through them -- its fine/coarse ghosts travel through the separate
+  // fc_remote_* path in multigrid.cpp, and icoar and ifine are read nowhere under
+  // src/multigrid or src/gravity.  A MeshBoundaryValuesCC owner with only
+  // same-level payloads has PackAndSendCC/RecvAndUnpackCC and the rank-packed metadata skip
+  // every cross-level neighbour, so ca is never touched; with stub_recv_same_vars its
+  // recv slots are stubs on multi-rank runs.  The flag must be set before
+  // InitializeBuffers so that the seed allocation already honours it.
+  bool same_level_vars_only = false;
+
+  // Storage of the per-neighbour flux payloads of slot n, resolved once per allocation by
+  // AllocateBufferSlot from the mesh, never opted into by an owner.  MeshBoundaryValuesFC
+  // keeps the default: its EMF exchange sends and receives same-level payloads on any
+  // mesh (flux_correct_fc.cpp), so both sides stay full size.  MeshBoundaryValuesCC
+  // narrows them (flux_correct_cc.cpp).
+  virtual FluxFootprint SendFluxFootprint(const int n) const {
+    return FluxFootprint::full;
+  }
+  virtual FluxFootprint RecvFluxFootprint(const int n) const {
+    return FluxFootprint::full;
+  }
 
   // constant inflow states at each face, initialized in problem generator
   DualArray2D<Real> u_in, b_in, i_in;
@@ -150,30 +606,236 @@ class MeshBoundaryValues {
   // unique MPI communicators for each case (variables/fluxes)
   MPI_Comm comm_vars, comm_flux;
 
-  // rank-packed vars communication path
+  // Rank-packed variable boundary communication. This aggregates all off-rank
+  // (MeshBlock,neighbor) payloads by peer rank, reducing many small MPI messages.
+  bool rank_packed_bvals_active_;
+  bool rank_packed_lat_capable_;
+  bool rank_packed_lat_active_;
+  // RecvAndUnpack kernels consume MPI receive storage asynchronously.  Before a
+  // later MPI_Irecv reuses that storage, InitRecv must establish completion.
+  bool recv_unpack_pending_;
+#if defined(KOKKOS_ENABLE_CUDA)
+  // ...but only the UNPACK has to be complete, not the whole device queue, which is
+  // what a DevExeSpace().fence() waits for.  In the LAT refresh path InitRecv is the
+  // first thing called after the previous refresh's prolongation/BC/C2P kernels have
+  // been submitted, so the plain fence drained all of those before a single receive
+  // could be posted -- and a receive that is not posted cannot start its rendezvous,
+  // so no peer traffic could overlap that work.  An event recorded on the Kokkos
+  // stream right after the unpack is reached as soon as the unpack retires, with the
+  // rest of the queue left running, which is exactly the guarantee the buffers need.
+  //
+  // Only the unpack kernels read this object's receive storage: same-rank payloads are
+  // written by the pack kernel into DIFFERENT (block,neighbour) slots than any off-rank
+  // Irecv target, and prolongation reads the coarse arrays, not the buffers.
+  //
+  // recv_unpack_event_valid_ is set ONLY by MarkRecvUnpackPending(); anything that
+  // raises recv_unpack_pending_ by hand (MultigridBoundaryValues::RecvAndUnpackMG does,
+  // and pairs it with its own fence) leaves it clear, and WaitRecvUnpackComplete() then
+  // falls back to the full fence.
+  cudaEvent_t recv_unpack_event_ = nullptr;
+  bool recv_unpack_event_valid_ = false;
+#endif
+  bool show_rank_packed_bvals_stats_;
   int rank_packed_bvals_nvars_;
-  int rank_packed_mesh_seq_;
+  int rank_packed_bvals_nmb_;
+  int rank_packed_bvals_nnghbr_;
+  std::uint64_t rank_packed_bvals_topology_version_;
   std::vector<RankPackedVarEntry> send_var_entries_, recv_var_entries_;
   std::vector<RankPackedVarMessage> send_var_msgs_, recv_var_msgs_;
-  std::vector<MPI_Request> send_var_reqs_, recv_var_reqs_;
+  // Persistent request handles for the dense (non-LAT) rank-packed path.  The LAT path
+  // keeps its own per-layout pair inside RankPackedVarLayout; VarReqs() selects between
+  // them.  Nothing here is ever MPI_REQUEST_NULL between create and free.
+  std::vector<MPI_Request> send_var_preqs_, recv_var_preqs_;
+  // Which LAT layout's requests were last MPI_Startall'ed, so ClearSend/ClearRecv and
+  // the completion test wait on the requests that were actually started rather than on
+  // whichever layout the mask happens to select later in the step.  -1 = dense path.
+  int lat_send_reqs_layout_ = -1;
+  int lat_recv_reqs_layout_ = -1;
+  bool send_var_reqs_started_ = false;
+  bool recv_var_reqs_started_ = false;
+  // Per-message completion, because a persistent request that has completed goes
+  // INACTIVE rather than to MPI_REQUEST_NULL: waiting on it again returns an EMPTY
+  // status, and the payload-size check would then compare against a count of 0.  Raised
+  // for the whole set at once by TestVarRecvComplete (MPI_Testall is all-or-nothing) and
+  // read by ClearRecv, which must skip what has already been verified.
+  std::vector<unsigned char> recv_var_done_;
+  // Audited rather than asserted: created must equal freed by the time this object dies.
+  std::uint64_t persistent_var_reqs_created_ = 0;
+  std::uint64_t persistent_var_reqs_freed_ = 0;
   DvceArray1D<Real> rank_sendbuf_vars_, rank_recvbuf_vars_;
-  // Scratch host buffers holding the (lid,dn,data_size) triples per entry, used
-  // only for the one-shot header exchange in BuildRankPackedVarMetadata that
-  // teaches each receiver its peers' pack order.
+  // Allocated capacity in Reals of the two aggregate payload buffers above.  Grow-only
+  // and MiB-granular (RankPackedBufCapacity), so a topology change that moves the
+  // off-rank payload total by a few entries no longer reallocates ~63 MiB of device
+  // memory.  Only the ALLOCATION is sticky: BuildRankPackedVarMetadata still rebuilds
+  // every offset and message descriptor whenever its topology key changes.
+  int rank_sendbuf_vars_cap_ = 0;
+  int rank_recvbuf_vars_cap_ = 0;
   HostArray1D<int> rank_sendhdr_vars_, rank_recvhdr_vars_;
-  // Per-(MeshBlock,neighbour) base offsets into the rank-packed aggregate
-  // buffers, dimensioned (nmb*nnghbr). For off-rank neighbours these hold the
-  // entry's offset in rank_{send,recv}buf_vars_; on-rank/non-existent entries
-  // are -1. Built once in BuildRankPackedVarMetadata so the pack/unpack kernels
-  // read/write the aggregate buffer directly (fusing the former
-  // RankPackAgg/RankUnpackScatter kernels into SendBuff/RecvBuff).
   DvceArray1D<int> send_agg_offset_, recv_agg_offset_;
+  // Same-rank cross-level payloads of a stub_recv_same_vars owner: local_xlev_offset_
+  // maps a receiving (m*nnghbr + n) to its region of local_xlev_vars_ (-1 when that
+  // neighbour is not a same-rank cross-level one).  Rebuilt with the rank-packed
+  // metadata; the payload buffer is grow-only like the aggregates.
+  DvceArray1D<Real> local_xlev_vars_;
+  int local_xlev_vars_cap_ = 0;
+  DvceArray1D<int> local_xlev_offset_;
+  std::vector<RankPackedVarLayout> lat_var_layouts_;
+  LATOffsetPool lat_var_offset_pool_;
+  std::unordered_map<LATLayoutCacheKey, int, LATLayoutCacheKeyHash>
+      lat_var_layout_cache_;
+  std::uint64_t lat_var_layout_cache_generation_{0};
+  int lat_var_layout_index_;
+
+  // LAT cell-centered flux correction uses a separate aggregate buffer because its
+  // selected face set and payload sizes differ from variable boundary communication.
+  bool rank_packed_lat_flux_active_;
+  int rank_packed_flux_nvars_;
+  int rank_packed_flux_nmb_;
+  int rank_packed_flux_nnghbr_;
+  bool rank_packed_flux_same_level_;
+  std::uint64_t rank_packed_flux_topology_version_;
+  DvceArray1D<Real> rank_sendbuf_flux_, rank_recvbuf_flux_;
+  // Capacity of the two buffers above, same policy as rank_*buf_vars_cap_.  Maintained
+  // by the cell-centered owner only (flux_correct_cc.cpp); MeshBoundaryValuesFC still
+  // sizes its own flux buffers exactly and leaves these at 0, which is harmless because
+  // a given object only ever runs one of the two paths.
+  int rank_sendbuf_flux_cap_ = 0;
+  int rank_recvbuf_flux_cap_ = 0;
+  std::vector<RankPackedFluxLayout> lat_flux_layouts_;
+  LATOffsetPool lat_flux_offset_pool_;
+  std::unordered_map<LATLayoutCacheKey, int, LATLayoutCacheKeyHash>
+      lat_flux_layout_cache_;
+  std::uint64_t lat_flux_layout_cache_generation_{0};
+  int lat_flux_layout_index_;
+  // Which LAT flux layout's persistent requests were last MPI_Startall'ed, mirroring
+  // lat_send_reqs_layout_/lat_recv_reqs_layout_ on the variable side.  -1 = none started,
+  // which is the only "dense" state the flux path has (it is LAT-only).
+  int lat_flux_send_reqs_layout_ = -1;
+  int lat_flux_recv_reqs_layout_ = -1;
+  bool send_flux_reqs_started_ = false;
+  bool recv_flux_reqs_started_ = false;
+  // Raised once RecvAndUnpackFlux*'s MPI_Testall has verified every payload size.  That
+  // test is all-or-nothing -- no request is modified unless all completed -- so a single
+  // flag covers the whole peer set, and ClearFluxRecv then knows the requests are already
+  // INACTIVE (a completed persistent request never becomes MPI_REQUEST_NULL, and waiting
+  // on it again would hand back an empty status with count 0).
+  bool recv_flux_counts_verified_ = false;
+  // Scratch for the MPI_Testall status array; grown to the peer count once, then reused.
+  std::vector<MPI_Status> mpi_statuses_;
+  // Legacy flux exchange (any phase whose LAT rank-packed flux layout is off): the
+  // off-rank messages of the current phase, staged through compact pooled buffers.  The
+  // requests stay in sendbuf[n].flux_req[m] and recvbuf[n].flux_req[m].  A received
+  // message is copied into recvbuf[n].flux(m, ...) once its request has completed and
+  // before any unpack reads it; legacy_flux_recv_copied_ marks the ones already copied.
+  LegacyFluxStage legacy_flux_send_, legacy_flux_recv_;
+  std::vector<unsigned char> legacy_flux_recv_copied_;
+  int legacy_flux_recv_uncopied_ = 0;
+  DvceArray1D<int> legacy_flux_recv_part_;   // copy table of a partial completion
 #endif
 
   //functions
   virtual void InitSendIndices(MeshBoundaryBuffer &buf,int x,int y,int z,int a,int b)=0;
   virtual void InitRecvIndices(MeshBoundaryBuffer &buf,int x,int y,int z,int a,int b)=0;
-  void InitializeBuffers(const int nvar);
+  void InitializeBuffers(const int nvar, const int nfluxvar = -1);
+  // Grow the per-neighbor send/recv buffers so they can hold `nmb` MeshBlocks.  The
+  // buffers are seeded from the LIVE block count in InitializeBuffers and grow only from
+  // there, which is the same high-water discipline the physics field arrays already use
+  // (Hydro::ResizeMeshBlockStorage).  Returns true if an allocation actually changed.
+  //
+  // Must be called at a synchronized point with no exchange in flight: the allocations
+  // do not preserve their contents and every base pointer moves.  The topology
+  // transaction (MeshRefinement::RedistAndRefineMeshBlocks, via each physics module's
+  // ResizeMeshBlockStorage) is the intended caller.
+  bool ResizeBuffers(const int nmb);
+  void RefreshDeviceBufferMetadata();
+  // Build the symmetric rank-packed variable topology at an explicitly synchronized,
+  // unmasked point. Delayed auxiliary activation uses this before its first exchange.
+  void PrepareRankPackedVarMetadata(const int nvars);
+
+#if MPI_PARALLEL_ENABLED
+  //! \brief persistent request vector for LAT layout `lat_layout` (-1 = dense path)
+  std::vector<MPI_Request> &VarReqs(bool is_send, int lat_layout);
+  //! \brief persistent flux request vector for LAT layout `lat_layout`
+  //!
+  //! Returns nullptr when the index addresses no layout: unlike the variable path there
+  //! is no dense rank-packed flux exchange, so that state simply means "nothing started".
+  std::vector<MPI_Request> *FluxReqs(bool is_send, int lat_layout);
+  //! \brief create the persistent requests for `msgs` if they do not exist yet
+  void EnsurePersistentReqs(const std::vector<RankPackedVarMessage> &msgs,
+                            Real *base, bool is_send, MPI_Comm comm, int tag,
+                            std::vector<MPI_Request> *reqs);
+  //! \brief EnsurePersistentReqs on comm_vars with the variable-boundary tag
+  void EnsurePersistentVarReqs(const std::vector<RankPackedVarMessage> &msgs,
+                               Real *base, bool is_send,
+                               std::vector<MPI_Request> *reqs);
+  //! \brief EnsurePersistentReqs on comm_flux with the flux-correction tag
+  void EnsurePersistentFluxReqs(const std::vector<RankPackedVarMessage> &msgs,
+                                Real *base, bool is_send,
+                                std::vector<MPI_Request> *reqs);
+  //! \brief MPI_Request_free every handle in `reqs` and empty it
+  //!
+  //! `started` means an MPI_Startall was issued and not yet drained.  Freeing an ACTIVE
+  //! persistent request is erroneous, so that is a hard error at a metadata rebuild --
+  //! where ClearSend/ClearRecv guarantee it cannot happen -- and a drain at teardown.
+  void FreePersistentVarReqs(std::vector<MPI_Request> *reqs, bool started,
+                             bool drain_at_teardown);
+  //! \brief free every persistent request this object owns, dense and per-layout
+  void FreeAllPersistentVarReqs(bool drain_at_teardown);
+  //! \brief free the per-layout requests; call immediately before lat_var_layouts_.clear()
+  void FreeLayoutPersistentVarReqs(bool drain_at_teardown = false);
+  //! \brief same for the flux layouts; call immediately before lat_flux_layouts_.clear()
+  //! or before either aggregate flux buffer is reallocated
+  void FreeLayoutPersistentFluxReqs(bool drain_at_teardown = false);
+  //! \brief one MPI_Testall over the started rank-packed variable receives
+  //!
+  //! Returns true when every receive has completed (payload sizes checked then, and
+  //! recv_var_done_ raised for ClearRecv), false for "not yet".  `*no_errors` is cleared
+  //! on any MPI error or size mismatch.
+  bool TestVarRecvComplete(bool *no_errors);
+  //! \brief one MPI_Testall over the started rank-packed flux receives
+  //!
+  //! Returns true when every receive has completed (payload sizes checked then), false
+  //! for "not yet".  `*no_errors` is cleared on any MPI error or size mismatch and
+  //! `*remote_recv` is raised if this rank has any off-rank flux receive at all.
+  bool TestFluxRecvComplete(bool *no_errors, bool *remote_recv);
+  //! \brief size legacy_flux_*_.buf for its messages and bring its device table up to
+  //! date (uploaded only when the message set changed)
+  void PrepareLegacyFluxStage(LegacyFluxStage *st);
+  //! \brief copy every staged send payload out of its sendbuf[n].flux row with one kernel
+  //! on `exec`, fence `exec`, then MPI_Isend each message from the staging buffer
+  //!
+  //! Returns false on an MPI error.  The fence is unconditional, as before the staging.
+  bool PostLegacyFluxSends(DevExeSpace exec);
+  //! \brief MPI_Irecv every staged receive into the compact receive buffer
+  bool PostLegacyFluxRecvs();
+  //! \brief copy every staged receive whose request has completed, and that is not yet
+  //! copied, into its recvbuf[n].flux row (one kernel); call before reading those rows
+  //!
+  //! Returns true if a copy was launched; the unpack-pending event then covers it.
+  bool CopyLegacyFluxRecvs();
+#endif
+
+  //! \brief note that an unpack kernel is in flight over this object's receive storage
+  void MarkRecvUnpackPending();
+  //! \brief same, for a caller that does NOT record the unpack event
+  //!
+  //! MultigridBoundaryValues unpacks on paths this class knows nothing about and pairs
+  //! them with its own full fence.  It must clear the event validity flag as it raises
+  //! the pending flag, or WaitRecvUnpackComplete() could later satisfy that pending
+  //! unpack by waiting on a stale event that retired several exchanges ago.
+  void MarkRecvUnpackPendingFullFence() {
+#if MPI_PARALLEL_ENABLED
+    recv_unpack_pending_ = true;
+#if defined(KOKKOS_ENABLE_CUDA)
+    recv_unpack_event_valid_ = false;
+#endif
+#endif
+  }
+  //! \brief wait for that unpack, and only that unpack, to retire
+  //!
+  //! Replaces `if (recv_unpack_pending_) { DevExeSpace().fence(); ... }`.  Falls back to
+  //! the full-device fence when no valid event was recorded.
+  void WaitRecvUnpackComplete();
 
   TaskStatus InitRecv(const int nvar);
   virtual TaskStatus InitFluxRecv(const int nvar)=0;
@@ -181,16 +843,26 @@ class MeshBoundaryValues {
   TaskStatus ClearSend();
   TaskStatus ClearFluxRecv();
   TaskStatus ClearFluxSend();
+  //! \brief defer ClearSend's wait on the variable sends just started on this object
+  //!
+  //! Nothing touches those requests or the aggregate send buffer until the next pack,
+  //! ClearSend, request free or buffer reallocation on this object, and each of those
+  //! drains the latch first (DrainLatchedSendClear), so only WHEN the host blocks
+  //! changes.  The per-block (non-rank-packed) path waits on the current LAT mask's
+  //! requests, which a later mask need not select, so it clears at once instead.
+  void LatchSendClear();
+  //! \brief complete a send-clear latched by LatchSendClear (no-op when none is)
+  void DrainLatchedSendClear();
 
   // BCs associated with various physics modules
   static void HydroBCs(MeshBlockPack *pp, DualArray2D<Real> uin, DvceArray5D<Real> u0);
-  static void BFieldBCs(MeshBlockPack *pp, DualArray2D<Real> bin, DvceFaceFld4D<Real> b0);
   static void HydroBCsCoarse(MeshBlockPack *pp, DualArray2D<Real> uin,
-                            DvceArray5D<Real> coarse_u0);
+                             DvceArray5D<Real> coarse_u0);
+  static void BFieldBCs(MeshBlockPack *pp, DualArray2D<Real> bin, DvceFaceFld4D<Real> b0);
   static void BFieldBCsCoarse(MeshBlockPack *pp, DualArray2D<Real> bin,
                               DvceFaceFld4D<Real> coarse_b0);
   static void RadiationBCs(MeshBlockPack *pp,DualArray2D<Real> iin,DvceArray5D<Real> i0);
-  static void RadiationBCsCoarse(MeshBlockPack *pp,DualArray2D<Real> iin,
+  static void RadiationBCsCoarse(MeshBlockPack *pp, DualArray2D<Real> iin,
                                  DvceArray5D<Real> coarse_i0);
   static void Z4cBCs(MeshBlockPack *pp, DualArray2D<Real> uin, DvceArray5D<Real> u0);
   static void Z4cBCsCoarse(MeshBlockPack *pp, DualArray2D<Real> uin,
@@ -201,10 +873,35 @@ class MeshBoundaryValues {
   // many types (Hydro, MHD, Radiation, Z4c, etc.)
   MeshBlockPack* pmy_pack;
   bool is_z4c_;   // flag to denote if this BoundaryValues is for Z4c module
+  bool communication_initialized_;
+  // A ClearSend wait deferred by LatchSendClear and not yet drained.
+  bool send_clear_latched_ = false;
+
+  // Current per-neighbor buffer capacity in MeshBlocks, plus the component counts the
+  // buffers were built with, so ResizeBuffers can rebuild them without the caller having
+  // to remember what InitializeBuffers was given.
+  int nmb_alloc_ = 0;
+  int buf_nvar_ = 0;
+  int buf_nflx_ = 0;
+  bool lat_requested_ = false;  // <time>/lat was requested for this run
+  // Round a required block count up to the capacity actually allocated.
+  int BufferBlockCapacity(const int nmb_needed) const;
+  // Allocate both payloads of slot n at a capacity of `nmb` MeshBlocks, honouring the
+  // owner's vars guarantees and the flux footprints above.  The one place they are
+  // resolved, so that the seed allocation and every regrowth agree.
+  void AllocateBufferSlot(const int n, const int nmb);
+  // Reallocate every per-neighbor payload at a capacity of `nmb` MeshBlocks.  Allocation
+  // only: the caller updates nmb_alloc_ and must follow with RefreshDeviceBufferMetadata
+  // and the rank-packed invalidation, because every base pointer moves.
+  void AllocateAllBuffers(const int nmb);
 
 #if MPI_PARALLEL_ENABLED
+  bool UseRankPackedVars() const;
+  void InvalidateRankPackedVarMetadata();
+  void EnsureRankPackedVarMetadata(const int nvars);
   int GetVarDataSize(const MeshBoundaryBuffer &buf, int m, int n, int nvars) const;
   void BuildRankPackedVarMetadata(const int nvars);
+  void PrepareLATRankPackedVarLayout();
 #endif
 };
 
@@ -212,32 +909,163 @@ class MeshBoundaryValues {
 //! \class BoundaryValuesCC
 //  \brief Derived class implementing boundary values for cell-centered variables
 
+//----------------------------------------------------------------------------------------
+//! \struct FaceFldOrigin
+//! \brief Index origin of a face-centred flux register stored on a sub-block band.
+//! The flux-correction routines index a register as flx.x?f(m,v,k-k0,j-j0,i-i0), so a
+//! module may allocate its face fluxes on the interior faces only (a cell-centred flux
+//! exists on no ghost face) and pass the origin (ks,js,is).  The default (0,0,0) is the
+//! ghost-extended block layout that the MHD/Hydro registers use.
+struct FaceFldOrigin {
+  int k = 0;
+  int j = 0;
+  int i = 0;
+};
+
 class MeshBoundaryValuesCC : public MeshBoundaryValues {
  public:
   MeshBoundaryValuesCC(MeshBlockPack *ppack, ParameterInput *pin, bool z4c);
+
+  // Ghost layers, in cells of the receiving MeshBlock, that the variable exchanges of
+  // this object fill; 0 (the default) means all ng.  Same-level and to-coarser payloads
+  // carry that many layers, and a coarser neighbour sends the parents of those layers
+  // plus, without exchange_injected, the one more that the min-mod stencil of
+  // ProlongateCC reads (ExchangeLayers).  An owner whose consumers read only the first
+  // few ghost layers sets it before InitializeBuffers; without injection it is rounded
+  // up to even, so that FillCoarseInBndryCC restricts received cells only.  Z4c and a
+  // mesh of narrow MeshBlocks always exchange all ng layers and ng parent layers.
+  int exchange_depth = 0;
+  // The owner completes its coarse/fine ghosts with InjectCC alone, which reads the
+  // parents only and no restricted same-level coarse ghost (no FillCoarseInBndryCC).
+  bool exchange_injected = false;
 
   //functions
   void InitSendIndices(MeshBoundaryBuffer &b,int o1,int o2,int o3,int f1,int f2) override;
   void InitRecvIndices(MeshBoundaryBuffer &b,int o1,int o2,int o3,int f1,int f2) override;
   TaskStatus InitFluxRecv(const int nvar) override;
 
+  // Flux payloads exist for the six face families only, and:
+  //   * a receive needs a SAME-level footprint only when time/lat_same_level is set: a
+  //     fine-to-coarse receive is the only one without it, and LAT never otherwise
+  //     routes a same-level flux (lat_flux_recv_nghbr, MeshBlockPack);
+  //   * a send never writes sendbuf.flux at nranks == 1 (every payload goes straight into
+  //     the destination recvbuf), and with more ranks only in the per-neighbour arm of
+  //     PackAndSendFluxCC, which carries the coarse footprint because a same-level send
+  //     requires lat_enabled and lat_enabled selects the rank-packed arm.  When LAT is
+  //     requested that arm runs only on cycles without an active mask (a window of one
+  //     fine tick, or a pass after the mask was cleared), so the buffers start as stubs
+  //     and EnsureSendFluxStorage grows them the first time such a cycle has a remote
+  //     coarse neighbour to send to.
+  FluxFootprint SendFluxFootprint(const int n) const override;
+  FluxFootprint RecvFluxFootprint(const int n) const override;
+
+  // Whether the LAT stage-1 dense snapshot (a_stage1 below) may be stored on the owned
+  // cells only, with origin (ks,js,is).  PackAndSendCC reads it only on the send ranges
+  // of InitSendIndices (buffs_cc.cpp): a same-level range is an ng-wide strip of owned
+  // cells, inside them when every extended axis holds nx >= ng, and a to-finer range is
+  // that strip shifted by cnx - ng, inside them when nx >= 2*ng.  Sends to a coarser
+  // neighbour read the coarse snapshot, which keeps its ghost-extended layout.
+  static bool LATStage1OwnedOnly(const RegionIndcs &indcs, const bool multilevel) {
+    const int nmin = (multilevel ? 2 : 1)*indcs.ng;
+    return indcs.nx1 >= nmin && (indcs.nx2 == 1 || indcs.nx2 >= nmin) &&
+           (indcs.nx3 == 1 || indcs.nx3 >= nmin);
+  }
   // functions to communicate CC data
-  TaskStatus PackAndSendCC(DvceArray5D<Real> &a, DvceArray5D<Real> &ca);
+  TaskStatus PackAndSendCC(DvceArray5D<Real> &a, DvceArray5D<Real> &ca,
+                           DvceArray5D<Real> *a_start = nullptr,
+                           Real target_time = 0.0,
+                           DvceArray5D<Real> *ca_start = nullptr,
+                           DvceArray5D<Real> *a_stage1 = nullptr,
+                           DvceArray5D<Real> *ca_stage1 = nullptr,
+                           DvceArray1D<int> *a_stage1_valid = nullptr,
+                           bool limit_dense_to_endpoints = true,
+                           const LATPendingBound &pending_bound = LATPendingBound());
   TaskStatus RecvAndUnpackCC(DvceArray5D<Real> &a, DvceArray5D<Real> &ca);
-  // functions to communicate fluxes of CC data
-  TaskStatus PackAndSendFluxCC(DvceFaceFld5D<Real> &flx);
-  TaskStatus RecvAndUnpackFluxCC(DvceFaceFld5D<Real> &flx);
+  // functions to communicate fluxes of CC data.  With `excised`, a fine face whose two
+  // cells are both marked in it enters the flux restricted to a coarser neighbour as zero.
+  TaskStatus PackAndSendFluxCC(DvceFaceFld5D<Real> &flx,
+                               DvceFaceFld5D<Real> *extra_flx = nullptr,
+                               bool time_integrate = false, Real weight = 1.0,
+                               FaceFldOrigin origin = {},
+                               const DvceArray4D<bool> *excised = nullptr);
+  TaskStatus RecvAndUnpackFluxCC(DvceFaceFld5D<Real> &flx,
+                                 DvceFaceFld5D<Real> *extra_flx = nullptr,
+                                 FaceFldOrigin origin = {});
+  TaskStatus RecvAndAccumulateFluxCC(DvceFaceFld5D<Real> &accum, Real scale,
+                                     bool compact_faces = false,
+                                     DvceFaceFld5D<Real> *extra_accum = nullptr,
+                                     DvceFaceFld5D<Real> *sync_flx = nullptr,
+                                     DvceFaceFld5D<Real> *extra_sync_flx = nullptr,
+                                     Real sync_integrated_weight = 0.0,
+                                     bool accumulate_sync_mismatch = true,
+                                     FaceFldOrigin origin = {},
+                                     bool store_pending_mismatch = false);
+  // Union stage-1 predictor: the fine-minus-own face flux mismatch captured by
+  // RecvAndAccumulateFluxCC(store_pending_mismatch) on every unequal-factor coarse/fine
+  // face, added to the own flux of the slower bin's corrector stage while that finer
+  // neighbour is still pending (flux_correct_cc.cpp).  The per-mass columns
+  // ratio_begin..ratio_end-1 of the state `u` (scalars, the GR gas entropy) take the
+  // mass mismatch (column idn) at the adjacent cell's own ratio.
+  void AddPendingFineFluxMismatchCC(DvceFaceFld5D<Real> &flx,
+                                    DvceFaceFld5D<Real> *extra_flx = nullptr,
+                                    FaceFldOrigin origin = {},
+                                    const DvceArray5D<Real> *u = nullptr, int idn = 0,
+                                    int ratio_begin = 0, int ratio_end = 0);
+  // Whether the call above adds anything in the current stage.
+  bool PendingFineFluxMismatchDue() const;
+  // Union stage-1 predictor: this block's own flux on the faces the capture above will
+  // replace, stored in the pending registers before a first-order flux correction can
+  // replace it, so the capture measures the mismatch against the operator the corrector
+  // adds it to (flux_correct_cc.cpp).  Takes the arguments of the owner's capture.
+  void SnapshotPendingOwnFluxCC(const DvceFaceFld5D<Real> &accum,
+                                const DvceFaceFld5D<Real> *extra_accum,
+                                const DvceFaceFld5D<Real> &flx,
+                                const DvceFaceFld5D<Real> *extra_flx,
+                                FaceFldOrigin origin = {});
+  void ReserveLATPendingMismatch(const DvceFaceFld5D<Real> &accum,
+                                 const DvceFaceFld5D<Real> *extra_accum);
+  DvceArray5D<Real> lat_pending_mismatch1_, lat_pending_mismatch2_;
+  DvceArray5D<Real> lat_pending_mismatch3_;
+  DvceArray5D<Real> lat_pending_extra1_, lat_pending_extra2_, lat_pending_extra3_;
+  bool lat_pending_captured_ = false;  // a flux receive has filled them
+  bool lat_pending_own_snapshot_ = false;  // they hold this stage's own flux
+  // Grow the stubbed per-neighbour send flux buffers to the coarse footprint, when this
+  // rank has a remote coarser neighbour to send to; see SendFluxFootprint.
+  void EnsureSendFluxStorage();
+  // Fatal error unless every face recv buffer holds a same-level payload whenever
+  // time/lat_same_level is set; see RecvFluxFootprint.
+  void RequireSameLevelFluxRecv(const char *where) const;
+  bool send_flux_grown_ = false;  // EnsureSendFluxStorage has allocated them
+
+#if MPI_PARALLEL_ENABLED
+  void PrepareLATRankPackedFluxLayout(const int nvars);
+#endif
 
   // functions to prolongate conserved and primitive CC variables
   void FillCoarseInBndryCC(DvceArray5D<Real> &a, DvceArray5D<Real> &ca,
        bool is_z4c=false);
+  void FillCoarseUserBndryCC(DvceArray5D<Real> &a, DvceArray5D<Real> &ca);
   void ProlongateCC(DvceArray5D<Real> &a, DvceArray5D<Real> &ca, bool is_z4c=false);
+  // Parent-ratio rule for the D*q columns v0..v0+nv-1 of a relativistic fluid after
+  // ProlongateCC(a, ca): see ProlongCCRatio (mesh/prolongation.hpp).
+  void ProlongateCCRatios(DvceArray5D<Real> &a, DvceArray5D<Real> &ca, const int v0,
+                          const int nv);
+  void InjectCC(DvceArray5D<Real> &a, DvceArray5D<Real> &ca);
   void ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons, DvceArray5D<Real> &prim);
   void PrimToConsFineBndry(const DvceArray5D<Real> &prim, DvceArray5D<Real> &cons);
   void ConsToPrimCoarseBndry(const DvceArray5D<Real> &cons, const DvceFaceFld4D<Real> &b,
                              DvceArray5D<Real> &prim);
-  void PrimToConsFineBndry(const DvceArray5D<Real> &prim, const DvceFaceFld4D<Real> &b,
+  void PrimToConsFineBndry(DvceArray5D<Real> &prim, const DvceFaceFld4D<Real> &b,
                            DvceArray5D<Real> &cons);
+
+ private:
+  // The layer counts of InitSendIndices/InitRecvIndices: fine ghost layers sent to a
+  // same-level or coarser receiver, parent layers prolongated into a finer receiver, and
+  // parent layers a coarser neighbour sends it.
+  void ExchangeLayers(int &nfine, int &nprol, int &ncoarse) const;
+  // Device copy of the ConsToPrimCoarseBndryImpl kernel (DeviceResident,
+  // utils/device_args.hpp).
+  DeviceArgs c2p_coarse_args_;
 };
 
 //----------------------------------------------------------------------------------------
@@ -256,6 +1084,7 @@ class MeshBoundaryValuesFC : public MeshBoundaryValues {
   TaskStatus PackAndSendFC(DvceFaceFld4D<Real> &b, DvceFaceFld4D<Real> &cb);
   TaskStatus RecvAndUnpackFC(DvceFaceFld4D<Real> &b, DvceFaceFld4D<Real> &cb);
   void FillCoarseInBndryFC(DvceFaceFld4D<Real> &b, DvceFaceFld4D<Real> &cb);
+  void FillCoarseUserBndryFC(DvceFaceFld4D<Real> &b, DvceFaceFld4D<Real> &cb);
   void ProlongateFC(DvceFaceFld4D<Real> &b, DvceFaceFld4D<Real> &cb);
 
   TaskStatus PackAndSendFluxFC(DvceEdgeFld4D<Real> &flx);
@@ -264,6 +1093,26 @@ class MeshBoundaryValuesFC : public MeshBoundaryValues {
                          DvceArray2D<int> &nflx);
   void ZeroFluxesAtBoundaryWithFiner(DvceEdgeFld4D<Real> &flx, DvceArray2D<int> &nflx);
   void AverageBoundaryFluxes(DvceEdgeFld4D<Real> &flx, DvceArray2D<int> &nflx);
+
+ private:
+  // Reused EMF-count scratch for RecvAndUnpackFluxFC.  Every call fully rewrites
+  // the rows of the blocks it works on before any consumer reads them, so the
+  // buffer only needs reallocation when the pack size changes.
+  DvceArray2D<int> fc_flux_count_scratch_;
+};
+
+template <int n = 56>
+struct BoundaryData { // aggregate and POD (even when MPI_PARALLEL is defined)
+  static constexpr int kMaxNeighbor = n;
+  // KGF: "nbmax" only used in bvals_var.cpp, Init/DestroyBoundaryData()
+  int nbmax;  //!> actual maximum number of neighboring MeshBlocks
+  // currently, sflag[] is only used by Multgrid (send buffers are reused each stage in
+  // red-black comm. pattern; need to check if they are available) and shearing box
+  BoundaryStatus flag[kMaxNeighbor], sflag[kMaxNeighbor];
+  Real *send[kMaxNeighbor], *recv[kMaxNeighbor];
+#ifdef MPI_PARALLEL
+  MPI_Request req_send[kMaxNeighbor], req_recv[kMaxNeighbor];
+#endif
 };
 
 //----------------------------------------------------------------------------------------

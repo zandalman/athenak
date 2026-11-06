@@ -49,8 +49,7 @@ void ProblemGenerator::RadiationBeam(ParameterInput *pin, const bool restart) {
   int nmb1 = (pmbp->nmb_thispack-1);
   int nang1 = (pmbp->prad->prgeo->nangles-1);
   auto &size = pmbp->pmb->mb_size;
-  auto &flat = pmbp->pcoord->coord_data.is_minkowski;
-  auto &spin = pmbp->pcoord->coord_data.bh_spin;
+  const KerrHole hole = pmbp->pcoord->coord_data.Hole();
   auto &use_excise = pmbp->pcoord->coord_data.bh_excise;
   auto &excision_floor_ = pmbp->pcoord->excision_floor;
 
@@ -78,7 +77,7 @@ void ProblemGenerator::RadiationBeam(ParameterInput *pin, const bool restart) {
       Real x3v = CellCenterX(k-ks, indcs.nx3, x3min, x3max);
 
       Real glower[4][4], gupper[4][4];
-      ComputeMetricAndInverse(x1v,x2v,x3v,flat,spin,glower,gupper);
+      ComputeMetricAndInverse(x1v,x2v,x3v,hole,glower,gupper);
 
       // Compute eta_alpha beta = g_mu nu e^mu_alpha e^nu_beta
       Real test_eta[4][4] = {};

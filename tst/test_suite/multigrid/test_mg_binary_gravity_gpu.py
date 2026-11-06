@@ -7,7 +7,9 @@ uniform-density spheres) on uniform and SMR meshes.
 Tests include:
   - Defect convergence per V-cycle (uniform 64^3, 2-level SMR 16^3 base)
   - Defect consistency: both configs have the same effective finest
-    resolution (64^3), so their final defects should be comparable.
+    resolution (64^3); their per-V-cycle geometric-mean contraction ratio
+    should be comparable (final defects legitimately differ, since the
+    solver stops at the first defect below threshold).
 
 show_defect modes: 1 = final only, 2 = per-iteration (initial + each V-cycle).
 """
@@ -18,7 +20,8 @@ from test_suite.multigrid.mg_utils import (
     assert_solver_convergence,
     run_athenak,
     parse_final_defect,
-    assert_defect_consistency,
+    compute_geo_mean_ratio,
+    assert_geo_mean_consistency,
     cleanup,
 )
 threshold = 4E-9
@@ -33,6 +36,7 @@ _GRAVITY_FLAGS = [
 ]
 
 _stored_defects = {}
+_stored_ratios = {}
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +65,9 @@ def test_binary_gravity_uniform_gpu(res, rg):
         d = parse_final_defect(results[1])
         if d is not None:
             _stored_defects["uniform"] = d
+        r = compute_geo_mean_ratio(results[1])
+        if r is not None:
+            _stored_ratios["uniform"] = r
     finally:
         cleanup()
 
@@ -89,6 +96,9 @@ def test_binary_gravity_smr_gpu(res, rg):
         d = parse_final_defect(results[1])
         if d is not None:
             _stored_defects["smr"] = d
+        r = compute_geo_mean_ratio(results[1])
+        if r is not None:
+            _stored_ratios["smr"] = r
     finally:
         cleanup()
 
@@ -98,11 +108,17 @@ def test_binary_gravity_smr_gpu(res, rg):
 # ---------------------------------------------------------------------------
 
 def test_binary_gravity_defect_consistency_gpu():
-    """Final defect should be comparable between uniform 64^3 and 2-level SMR."""
+    """Uniform and SMR should converge at a comparable per-cycle rate.
+
+    Final defects differ legitimately (the solver stops at the first defect
+    below threshold), so this compares the geometric-mean per-V-cycle
+    contraction ratio instead; see assert_geo_mean_consistency.
+    """
     if "uniform" not in _stored_defects or "smr" not in _stored_defects:
         pytest.skip("Prerequisite tests did not run or failed")
-    assert_defect_consistency(
-        [_stored_defects["uniform"], _stored_defects["smr"]],
-        max_spread=0.15,
+    if "uniform" not in _stored_ratios or "smr" not in _stored_ratios:
+        pytest.skip("Prerequisite tests did not run or failed")
+    assert_geo_mean_consistency(
+        _stored_defects, _stored_ratios, threshold,
         label="binary_gravity_defect_consistency_gpu: ",
     )

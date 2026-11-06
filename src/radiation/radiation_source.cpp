@@ -54,8 +54,7 @@ TaskStatus Radiation::RadFluidCoupling(Driver *pdriver, int stage) {
 
   // Extract coordinate/excision data
   auto &coord = pmy_pack->pcoord->coord_data;
-  bool &flat = coord.is_minkowski;
-  Real &spin = coord.bh_spin;
+  const KerrHole hole = coord.Hole();
   bool &excise = pmy_pack->pcoord->coord_data.bh_excise;
   auto &rad_mask_ = pmy_pack->pcoord->excision_floor;
   Real &n_0_floor_ = n_0_floor;
@@ -69,8 +68,8 @@ TaskStatus Radiation::RadFluidCoupling(Driver *pdriver, int stage) {
   if (are_units_enabled_) {
     density_scale_ = pmy_pack->punit->density_cgs();
     temperature_scale_ = pmy_pack->punit->temperature_cgs();
-    length_scale_ = pmy_pack->punit->length_cgs();
     mean_mol_weight_ = pmy_pack->punit->mu();
+    length_scale_ = pmy_pack->punit->length_cgs();
     rosseland_coef_ = pmy_pack->punit->rosseland_coef_cgs;
     planck_minus_rosseland_coef_ = pmy_pack->punit->planck_minus_rosseland_coef_cgs;
     inv_t_electron_ = temperature_scale_/pmy_pack->punit->electron_rest_mass_energy_cgs;
@@ -137,7 +136,7 @@ TaskStatus Radiation::RadFluidCoupling(Driver *pdriver, int stage) {
 
     // compute metric and inverse
     Real glower[4][4], gupper[4][4];
-    ComputeMetricAndInverse(x1v,x2v,x3v,flat,spin,glower,gupper);
+    ComputeMetricAndInverse(x1v,x2v,x3v,hole,glower,gupper);
     Real alpha = sqrt(-1.0/gupper[0][0]);
 
     // fluid state

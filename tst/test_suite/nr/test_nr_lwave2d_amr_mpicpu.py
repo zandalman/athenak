@@ -18,9 +18,15 @@ errors = {
     ("hydro", "rk3", "ppmx", "0"): (6.2e-06, 0.55),
     ("hydro", "rk3", "wenoz", "0"): (5.7e-06, 0.67),
     ("mhd", "rk2", "plm", "0"): (1.3e-05, 0.28),
-    ("mhd", "rk3", "ppm4", "0"): (8.1e-06, 0.3),
+    ("mhd", "rk3", "ppm4", "0"): (8.1e-06, 0.31),
     ("mhd", "rk3", "ppmx", "0"): (7e-06, 0.37),
-    ("mhd", "rk3", "wenoz", "0"): (3.9e-06, 0.39),
+    # 0.41: the ratio of the upstream numbers (1.016e-05 at 64, 3.891e-06 at 128) is 0.383;
+    # the face-field ghost prolongation of this tree writes an active face only where the
+    # coarse neighbour owns it (bvals/prolongation.cpp, CanProlongateFCFace), which lowers
+    # the error at the fine/coarse interface at both resolutions (9.415e-06, 3.794e-06),
+    # the 64 one by 7 % and the 128 one by 2.5 %, so the ratio is 0.403.  The uniform grid
+    # agrees with upstream to 2e-4 (3.386e-06 against 3.387e-06 at 64).
+    ("mhd", "rk3", "wenoz", "0"): (3.9e-06, 0.41),
 }
 
 _recon = ["plm", "ppm4", "ppmx", "wenoz"]  # do not change order

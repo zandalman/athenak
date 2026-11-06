@@ -81,6 +81,7 @@ void KerrSchild(MeshBlockPack *pmbp, ParameterInput *pin) {
   Real center_x3 = pin->GetOrAddReal("problem", "punc_center_x3", 0.);
   Real a = pin->GetOrAddReal("problem", "punc_spin", 0.);
   bool minkowski = false;
+  const KerrHole hole{minkowski, 1.0, a};
 
   // capture variables for the kernel
   auto &indcs = pmbp->pmesh->mb_indcs;
@@ -108,7 +109,7 @@ void KerrSchild(MeshBlockPack *pmbp, ParameterInput *pin) {
     Real &x3max = size.d_view(m).x3max;
     Real x3v = CellCenterX(k-ks, indcs.nx3, x3min, x3max);
 
-    ComputeADMDecomposition(x1v, x2v, x3v, minkowski, a,
+    ComputeADMDecomposition(x1v, x2v, x3v, hole,
       &adm.alpha(m,k,j,i),
       &adm.beta_u(m,0,k,j,i), &adm.beta_u(m,1,k,j,i), &adm.beta_u(m,2,k,j,i),
       &adm.psi4(m,k,j,i),

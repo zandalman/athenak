@@ -227,6 +227,9 @@ void ProblemGenerator::BinaryGravity(ParameterInput *pin, const bool restart) {
       bcc0(m,IBX,k,j,i) = b0_val;
       bcc0(m,IBY,k,j,i) = 0.0;
       bcc0(m,IBZ,k,j,i) = 0.0;
+      if (is_ideal) {
+        u0(m, IEN, k, j, i) += 0.5 * SQR(b0_val);
+      }
     });
   }
 }
@@ -268,15 +271,15 @@ void BinaryGravityErrors(ParameterInput *pin, Mesh *pm) {
   auto &size = pmbp->pmb->mb_size;
   auto &phi = pmbp->pgrav->phi;
 
-  // Reduce sums (pot_l1, acc_l1) and maxes (pot_max, acc_max) simultaneously.
+  // Reduce squared-error sums and maxes simultaneously.
   // Kokkos multi-reducer: 4 scalar outputs, 2 sums + 2 maxes.
-  Real pot_l1_sum = 0.0, acc_l1_sum = 0.0;
+  Real pot_l2_sum = 0.0, acc_l2_sum = 0.0;
   Real pot_max_val = 0.0, acc_max_val = 0.0;
 
   Kokkos::parallel_reduce(
       "binary_gravity_errors",
       Kokkos::RangePolicy<>(DevExeSpace(), 0, nmkji),
-      KOKKOS_LAMBDA(int idx, Real &lpot_l1, Real &lacc_l1,
+      KOKKOS_LAMBDA(int idx, Real &lpot_l2, Real &lacc_l2,
                     Real &lpot_max, Real &lacc_max) {
         int ii = idx % ni;
         int jj = (idx / ni) % nj;
@@ -342,22 +345,22 @@ void BinaryGravityErrors(ParameterInput *pin, Mesh *pm) {
             std::sqrt((SQR(ax_n - ax0) + SQR(ay_n - ay0) + SQR(az_n - az0)) / a_denom2)
             : 0.0;
 
-        lpot_l1 += perr * vol;
-        lacc_l1 += aerr * vol;
+        lpot_l2 += SQR(perr) * vol;
+        lacc_l2 += SQR(aerr) * vol;
         if (perr > lpot_max) lpot_max = perr;
         if (aerr > lacc_max) lacc_max = aerr;
       },
-      Kokkos::Sum<Real>(pot_l1_sum), Kokkos::Sum<Real>(acc_l1_sum),
+      Kokkos::Sum<Real>(pot_l2_sum), Kokkos::Sum<Real>(acc_l2_sum),
       Kokkos::Max<Real>(pot_max_val), Kokkos::Max<Real>(acc_max_val));
 
 #if MPI_PARALLEL_ENABLED
-  Real local_sums[2] = {pot_l1_sum, acc_l1_sum};
+  Real local_sums[2] = {pot_l2_sum, acc_l2_sum};
   Real local_maxes[2] = {pot_max_val, acc_max_val};
   Real global_sums[2], global_maxes[2];
   MPI_Allreduce(local_sums, global_sums, 2, MPI_ATHENA_REAL, MPI_SUM, MPI_COMM_WORLD);
   MPI_Allreduce(local_maxes, global_maxes, 2, MPI_ATHENA_REAL, MPI_MAX, MPI_COMM_WORLD);
-  pot_l1_sum = global_sums[0];
-  acc_l1_sum = global_sums[1];
+  pot_l2_sum = global_sums[0];
+  acc_l2_sum = global_sums[1];
   pot_max_val = global_maxes[0];
   acc_max_val = global_maxes[1];
 #endif
@@ -367,8 +370,8 @@ void BinaryGravityErrors(ParameterInput *pin, Mesh *pm) {
   Real x3size = pm->mesh_size.x3max - pm->mesh_size.x3min;
   Real tvol = x1size * x2size * x3size;
 
-  Real pot_l2 = std::sqrt(pot_l1_sum / tvol);
-  Real acc_l2 = std::sqrt(acc_l1_sum / tvol);
+  Real pot_l2 = std::sqrt(pot_l2_sum / tvol);
+  Real acc_l2 = std::sqrt(acc_l2_sum / tvol);
 
   if (global_variable::my_rank == 0) {
     std::cout << std::scientific

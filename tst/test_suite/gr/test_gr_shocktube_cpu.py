@@ -18,7 +18,7 @@ import athena_read
 import numpy as np
 
 _recon = ["plm", "ppm4", "ppmx", "wenoz"]  # do not change order
-_flux = ["llf", "hlle"]
+_flux = ["llf", "hlle", "hlld"]
 _res = [256, 512]  # resolutions to test
 _soe = ["hydro", "mhd"]  # system of equations to test
 name = {"hydro": "mb2", "mhd": "mub1"}  # names of the tests
@@ -34,12 +34,14 @@ def arguments(iv, rv, fv, res, name, soe):
         f"job/basename={name}_{iv}_{rv}_{fv}_{res}",
         "mesh/nx1=" + repr(res),
         "meshblock/nx1=" + repr(128),
-        "mesh/nghost=" + repr(2 if rv == "plm" else 3),
+        "mesh/nghost=" + repr(2 if rv == "plm" else 4),
         "time/integrator=" + iv,
         "time/cfl_number=0.2",
         "coord/special_rel=false",
         "coord/general_rel=true",
         f"{soe}/reconstruct=" + rv,
+        # wenoz and ppmx on a relativistic fluid require the FOFC closure (hydro.cpp, mhd.cpp)
+        *([f"{soe}/fofc=true"] if rv in ("ppmx", "wenoz") else []),
         f"{soe}/rsolver=" + fv,
     ]
 
@@ -61,6 +63,8 @@ results = {}
 @pytest.mark.parametrize("soe", _soe)
 def test_run(fv, rv, soe):
     """Run a single test with given parameters, store density in results[]."""
+    if fv == "hlld" and soe == "hydro":
+        pytest.skip("GR HLLD is only available for MHD tests.")
     iv = "rk2" if rv == "plm" else "rk3"
     try:
         for res in _res:
@@ -74,6 +78,8 @@ def test_run(fv, rv, soe):
 @pytest.mark.parametrize("fv", _flux)
 @pytest.mark.parametrize("soe", _soe)
 def test_convergence(fv, rv, soe):
+    if fv == "hlld" and soe == "hydro":
+        pytest.skip("GR HLLD is only available for MHD tests.")
     if ref_key[soe] == (fv, rv):
         pytest.skip("Can't compare reference against reference")
 

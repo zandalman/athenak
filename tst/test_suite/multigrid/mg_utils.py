@@ -227,16 +227,19 @@ def assert_jeans_growth_rate(input_file: str, flags_fn, res_list: List[int],
 
 
 def parse_amr_block_counts(stdout: str) -> Optional[Dict[str, int]]:
-    """Parse AMR block creation/deletion counts from stdout.
+    """Parse the run-total AMR block creation/deletion counts from stdout.
 
-    Matches lines like:
+    AthenaK prints one cumulative line per AMR event, e.g.:
       1008 MeshBlocks created, 0 deleted by AMR
+    (see src/mesh/mesh_refinement.cpp:1630-1632). Each line already reports
+    the running total, so the LAST match is the run total, not the first.
     Returns dict with keys 'created' and 'deleted', or None if not found.
     """
-    m = re.search(
+    matches = re.findall(
         r"(\d+)\s+MeshBlocks\s+created,\s+(\d+)\s+deleted\s+by\s+AMR", stdout)
-    if m:
-        return {"created": int(m.group(1)), "deleted": int(m.group(2))}
+    if matches:
+        created, deleted = matches[-1]
+        return {"created": int(created), "deleted": int(deleted)}
     return None
 
 
@@ -251,6 +254,23 @@ def parse_final_defect(stdout: str) -> Optional[float]:
     if matches:
         return float(matches[-1])
     return None
+
+
+def _solve_geo_mean_ratio(defects: List[float]) -> Optional[float]:
+    """Geometric mean of the per-V-cycle contraction ratios of one solve.
+
+    Shared by assert_solver_convergence and compute_geo_mean_ratio so the
+    ratio arithmetic (and its edge cases) is defined in exactly one place.
+    Returns None if there are no positive-defect consecutive pairs to form a
+    ratio from (e.g. a solve with only an initial defect and no V-cycles).
+    """
+    ratios = [defects[i + 1] / defects[i]
+              for i in range(len(defects) - 1) if defects[i] > 0]
+    if not ratios:
+        return None
+    if any(r == 0.0 for r in ratios):
+        return 0.0
+    return math.exp(sum(math.log(r) for r in ratios) / len(ratios))
 
 
 def assert_solver_convergence(stdout: str, threshold: float,
@@ -273,8 +293,13 @@ def assert_solver_convergence(stdout: str, threshold: float,
     max_vcycles = 0
     worst_geo_mean = 0.0
     for si, defects in enumerate(solves):
-        if len(defects) < 2:
-            continue
+        if not defects:
+            pytest.fail(
+                f"{label}Solve {si}: empty MG defect trajectory")
+        if any(not math.isfinite(defect) or defect < 0.0
+               for defect in defects):
+            pytest.fail(
+                f"{label}Solve {si}: invalid MG defect trajectory {defects}")
         n_vc = len(defects) - 1
         max_vcycles = max(max_vcycles, n_vc)
 
@@ -284,11 +309,8 @@ def assert_solver_convergence(stdout: str, threshold: float,
                 f"{label}Solve {si}: final defect {final:.3e} > "
                 f"{threshold:.3e} after {n_vc} V-cycles")
 
-        ratios = [defects[i+1] / defects[i]
-                  for i in range(len(defects) - 1) if defects[i] > 0]
-        if ratios:
-            geo_mean = math.exp(
-                sum(math.log(r) for r in ratios) / len(ratios))
+        geo_mean = _solve_geo_mean_ratio(defects)
+        if geo_mean is not None:
             worst_geo_mean = max(worst_geo_mean, geo_mean)
 
     if max_vcycles > max_iterations:
@@ -302,6 +324,26 @@ def assert_solver_convergence(stdout: str, threshold: float,
             f"exceeds {max_avg_ratio}")
 
     return max_vcycles, worst_geo_mean, solves
+
+
+def compute_geo_mean_ratio(stdout: str) -> Optional[float]:
+    """Return the worst-case per-V-cycle geometric-mean contraction ratio.
+
+    Parses per-solve defect trajectories the same way assert_solver_convergence
+    does (via parse_mg_defects_per_solve + _solve_geo_mean_ratio), and returns
+    the largest geometric-mean ratio across solves -- the same quantity
+    assert_solver_convergence checks against max_avg_ratio. Returns None if no
+    MG defect output was found, or if no solve had a usable ratio.
+    """
+    solves = parse_mg_defects_per_solve(stdout)
+    if not solves:
+        return None
+    worst = None
+    for defects in solves:
+        geo_mean = _solve_geo_mean_ratio(defects)
+        if geo_mean is not None:
+            worst = geo_mean if worst is None else max(worst, geo_mean)
+    return worst
 
 
 def assert_defect_consistency(defects: List[float], max_spread: float,
@@ -320,4 +362,47 @@ def assert_defect_consistency(defects: List[float], max_spread: float,
         pytest.fail(
             f"{label}Defect spread {spread:.2f} orders exceeds threshold "
             f"{max_spread}. Values: {[f'{d:.3e}' for d in defects]}"
+        )
+
+
+def assert_geo_mean_consistency(final_defects: Dict[str, float],
+                                geo_mean_ratios: Dict[str, float],
+                                threshold: float,
+                                max_log_ratio: float = 0.5,
+                                label: str = ""):
+    """Assert uniform and SMR runs converge at a comparable per-cycle rate.
+
+    The solver stops at the first defect below `threshold`, so on uniform vs
+    SMR meshes the final defect can legitimately differ by up to one V-cycle
+    of contraction (~1.3 orders); comparing final defects directly is
+    therefore the wrong test. Instead this checks that both final defects are
+    below `threshold`, and that the per-V-cycle geometric-mean contraction
+    ratio (from compute_geo_mean_ratio) agrees to within `max_log_ratio` in
+    log10 space: abs(log10(r_smr / r_uniform)) <= max_log_ratio.
+    """
+    for key in ("uniform", "smr"):
+        if final_defects.get(key) is None or geo_mean_ratios.get(key) is None:
+            pytest.fail(f"{label}Missing stored result for '{key}'")
+
+    for key in ("uniform", "smr"):
+        fd = final_defects[key]
+        if fd > threshold:
+            pytest.fail(
+                f"{label}Final defect for {key} {fd:.3e} exceeds threshold "
+                f"{threshold:.3e}"
+            )
+
+    r_uniform = geo_mean_ratios["uniform"]
+    r_smr = geo_mean_ratios["smr"]
+    if r_uniform <= 0 or r_smr <= 0:
+        pytest.fail(
+            f"{label}Non-positive geometric-mean ratio: "
+            f"r_uniform={r_uniform}, r_smr={r_smr}"
+        )
+    log_ratio = abs(math.log10(r_smr / r_uniform))
+    if log_ratio > max_log_ratio:
+        pytest.fail(
+            f"{label}Contraction-ratio mismatch: "
+            f"abs(log10(r_smr/r_uniform))={log_ratio:.3f} exceeds "
+            f"{max_log_ratio}. r_uniform={r_uniform:.4f}, r_smr={r_smr:.4f}"
         )

@@ -25,6 +25,7 @@ def _selfgravity_flags_mpi(res, nsmooth, fmg, mb=None):
         f"meshblock/nx1={mb}", f"meshblock/nx2={mb}", f"meshblock/nx3={mb}",
         "time/nlim=1",
         f"gravity/threshold={threshold}",
+        "gravity/niteration=-1",
         f"gravity/npresmooth={nsmooth}",
         f"gravity/npostsmooth={nsmooth}",
         f"gravity/full_multigrid={fmg}",

@@ -8,7 +8,6 @@
 
 #include <cstdint>
 #include <iostream>
-#include <sstream>
 #include <stdexcept>
 
 #include "athena.hpp"
@@ -32,6 +31,10 @@ MeshBlockTree::MeshBlockTree(Mesh *pmesh) :
   lloc_.lx2 = 0;
   lloc_.lx3 = 0;
   lloc_.level = 0;
+}
+
+void MeshBlockTree::ActivateRoot() {
+  proot_ = this;
 }
 
 //----------------------------------------------------------------------------------------
@@ -359,7 +362,6 @@ void MeshBlockTree::CreateZOrderedLLList(LogicalLocation *list, int *pglist, int
 
 MeshBlockTree* MeshBlockTree::FindNeighbor(LogicalLocation myloc,
                                            int ox1, int ox2, int ox3, bool amrflag) {
-  std::stringstream msg;
   std::int32_t lx, ly, lz;
   int ll;
   int ox, oy, oz;
@@ -476,4 +478,11 @@ MeshBlockTree* MeshBlockTree::FindMeshBlock(LogicalLocation tloc) {
     return nullptr;
   }
   return pleaf_[n]->FindMeshBlock(tloc);
+}
+
+void MeshBlockTree::SetLeafGID(LogicalLocation tloc, int gid) {
+  MeshBlockTree *bt = FindMeshBlock(tloc);
+  if (bt != nullptr) {
+    bt->gid_ = gid;
+  }
 }

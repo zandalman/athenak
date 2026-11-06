@@ -16,7 +16,6 @@
 #include <string>
 
 #include "athena.hpp"
-#include "diffusion/sts_types.hpp"
 
 // Define following structure before other "include" files to resolve declarations
 //----------------------------------------------------------------------------------------
@@ -64,14 +63,51 @@ struct LogicalLocation {
   std::int32_t lx1, lx2, lx3, level;
 };
 
+//! \fn bool ZOrderPrecedes(const LogicalLocation &a, const LogicalLocation &b)
+//! \brief True when MeshBlock a comes before b in the depth-first order of the
+//! MeshBlockTree (child index ox1 + 2 ox2 + 4 ox3), the order in which
+//! MeshBlockTree::CreateZOrderedLLList numbers a fresh or regridded tree.  The gids
+//! themselves are not this order once a LAT repartition has permuted them, and a restart
+//! renumbers them, so a choice between equal candidates that must be the same in a run
+//! and in its restart breaks the tie with this.  The two are compared on the coarser
+//! one's level, where the most significant differing bit of the coordinates picks the
+//! child, x3 before x2 before x1 at the same bit; an ancestor precedes its descendants.
+inline bool ZOrderPrecedes(const LogicalLocation &a, const LogicalLocation &b) {
+  const int lev = (a.level < b.level) ? a.level : b.level;
+  const std::uint64_t ca[3] = {static_cast<std::uint64_t>(a.lx1) >> (a.level - lev),
+                               static_cast<std::uint64_t>(a.lx2) >> (a.level - lev),
+                               static_cast<std::uint64_t>(a.lx3) >> (a.level - lev)};
+  const std::uint64_t cb[3] = {static_cast<std::uint64_t>(b.lx1) >> (b.level - lev),
+                               static_cast<std::uint64_t>(b.lx2) >> (b.level - lev),
+                               static_cast<std::uint64_t>(b.lx3) >> (b.level - lev)};
+  int dim = 0;
+  for (int n = 1; n < 3; ++n) {
+    const std::uint64_t dn = ca[n] ^ cb[n], dd = ca[dim] ^ cb[dim];
+    // dn's highest bit is not below dd's
+    if (!(dn < dd && dn < (dn ^ dd))) dim = n;
+  }
+  if (ca[dim] == cb[dim]) return a.level < b.level;
+  return ca[dim] < cb[dim];
+}
+
 //----------------------------------------------------------------------------------------
 //! \struct EventCounters
 //! \brief stores various counters used as diagnostics throughout the code
 
 struct EventCounters {
   int nfofc, neos_dfloor, neos_efloor, neos_tfloor, neos_vceil, neos_fail, maxit_c2p;
+  // Cells whose state came from the GR entropy inversion (KORAL's ENTROPYFLAG): the
+  // energy inversion failed there and U2P_ENTROPY succeeded.
+  int neos_entropy;
+  // Rank-local cumulative total energy (sum over interior cells of dE*dV, weighted by
+  // the RK stage's contribution to the completed step) added or removed by EOS floors,
+  // ceilings and excision resets in conserved-to-primitive conversions.
+  Real eos_floor_energy;
+  Real eos_floor_mass;  // same weighting, for the mass added/removed by floors
   EventCounters() : nfofc(0), neos_dfloor(0), neos_efloor(0), neos_tfloor(0),
-                    neos_vceil(0), neos_fail(0), maxit_c2p(0) {}
+                    neos_vceil(0), neos_fail(0), maxit_c2p(0), neos_entropy(0),
+                    eos_floor_energy(0.0),
+                    eos_floor_mass(0.0) {}
 };
 
 // Forward declarations required due to recursive definitions amongst mesh classes
@@ -85,7 +121,11 @@ class Mesh;
 #include "meshblock_pack.hpp"
 #include "meshblock_tree.hpp"
 #include "mesh_refinement.hpp"
-#include "cyclic_zoom/cyclic_zoom.hpp"
+#include "lat_partition.hpp"
+
+namespace remap {
+void AddSourceTreeLeaves(Mesh *pm, ParameterInput *pin);
+}  // namespace remap
 
 //----------------------------------------------------------------------------------------
 //! \class Mesh
@@ -100,6 +140,8 @@ class Mesh {
   friend class MeshRefinement;
   // needs to access tree to find target MB offset by shear
   friend class ShearingBox;
+  // adds the inherited MeshBlock tree of a <remap> source (remap_expand.cpp)
+  friend void remap::AddSourceTreeLeaves(Mesh *pm, ParameterInput *pin);
 
  public:
   explicit Mesh(ParameterInput *pin);
@@ -127,11 +169,83 @@ class Mesh {
 
   int nprtcl_thisrank;     // number of particles this rank
   int nprtcl_total;        // total number of particles across all ranks
+  std::uint64_t topology_version;  // increments whenever AMR/load-balance changes mesh topology
+  int topology_last_change_cycle;
+  bool hydro_lat_metadata_valid;
+  bool hydro_lat_same_level;
+  bool hydro_lat_diagnostics;
+  int hydro_lat_same_level_max_ratio;
+  int hydro_lat_neighbor_limiter_mode; // 0=all, 1=hybrid, 2=face
+  int hydro_lat_min_bin_count;
+  Real hydro_lat_pin_density_contrast;
+  Real hydro_lat_pin_density;
+  int hydro_lat_metadata_nmb;
+  int hydro_lat_sync_factor_current;
+  // True while a problem generator has paused the LAT windows.  Driver::Execute then
+  // takes every cycle as one plain step of the global time step, which is what it already
+  // does whenever no block can use a factor above 1, so the LAT configuration, the
+  // pgen's LAT hooks and the rest of the machinery stay in force and LAT resumes at the
+  // next window as soon as the flag is cleared.  A pgen sets and clears it at a
+  // synchronized point, identically on every rank (the settle steps of the remap module
+  // are the user); remap::LoadAndApplyRemap accepts a mid-run call under LAT only while
+  // it is set.
+  bool hydro_lat_suspended;
+  static constexpr std::uint64_t kInvalidLATVersion = ~std::uint64_t{0};
+  // Smallest predicted relative window-time gain for which a LAT block->rank migration
+  // is worth its cost (seconds of whole-block transfer against a ~20 s window).  Used
+  // both to trigger an attempt (UpdateHydroLATMetadata, against the perfect-balance
+  // bound) and to accept its result (MeshRefinement::RedistAndRefineMeshBlocks).
+  static constexpr double kHydroLATRebalanceMinRelativeGain = 0.05;
+  std::uint64_t hydro_lat_metadata_version;
+  std::uint64_t hydro_lat_metadata_topology_version;
+  std::uint64_t hydro_lat_lb_topology_version;
+  std::uint64_t hydro_lat_lb_metadata_version;
+  // Version of hydro_lat_work_eachmb, bumped only when the measured work changed AND
+  // the partition it would now choose can beat the current one by the rebalance
+  // threshold (see UpdateHydroLATMetadata); the lb_ copy is stamped by every partition
+  // attempt.  Separate from hydro_lat_metadata_version because that one invalidates the
+  // rank-packed boundary layouts, which a pure weight change must not touch.
+  std::uint64_t hydro_lat_work_version;
+  std::uint64_t hydro_lat_lb_work_version;
+  int hydro_lat_lb_last_attempt_cycle;
+  Real hydro_lat_global_hydro_dt;
+  // The mesh dt exactly as Mesh::NewTimeStep left it, and the time left to tlim then.
+  // The dt bounds the LAT tick UpdateHydroLATMetadata chooses, which may be shorter; a
+  // second rebuild in the same window (after a rebalance) starts again from this bound
+  // and so chooses the same tick.  Within one window of tlim the tick is not shortened:
+  // the driver lands the last window on tlim by clamping its ticks, and a shortened one
+  // would leave a sliver of a step behind.
+  Real hydro_lat_tick_bound;
+  Real hydro_lat_time_to_tlim;
+  Real *hydro_lat_dt_eachmb;
+  int *hydro_lat_factor_eachmb;
+  // Per-block relative work of ONE step of the block at its LAT factor, 1 = a block
+  // with no stiff cell; measured by the physics modules at every synchronized point and
+  // gathered with the factors.  The partition cost is (steps per window) x this.
+  Real *hydro_lat_work_eachmb;
+  // Per-factor bin counts: hydro_lat_bin_count[i] = # of MBs with factor 2^i.
+  // Valid when hydro_lat_metadata_valid.  Max 21 levels (factor up to 2^20).
+  static constexpr int kMaxLATBinLevels = 21;
+  int hydro_lat_bin_count[kMaxLATBinLevels];
+  int HydroLATBinCountForFactor(int factor) const;
+  bool hydro_lat_gid_reordered;
+  // Inputs of the LAT partition (BuildLATPartition) set by the driver at every window:
+  // the realised window length W in ticks (0 before the first window, which leaves the
+  // classes min(f, W) at f), the ticks H until the next partition event, and the state
+  // exchanges per block step E.  The machine tree is measured once per launch.  None of
+  // them is checkpointed.
+  int hydro_lat_window_ticks = 0;
+  double hydro_lat_partition_horizon = 0.0;
+  int hydro_lat_exchanges_per_step = 3;
+  LATRankTree lat_rank_tree;
 
   // following 3x arrays allocated with length [nmb_total] in BuildTreeFromXXXX()
   float *cost_eachmb;            // cost of each MeshBlock
   int *rank_eachmb;              // rank of each MeshBlock
   LogicalLocation *lloc_eachmb;  // LogicalLocations for each MeshBlock
+  // For LAT-reordered restarts, maps current GID to the restart-file GID whose
+  // payload stores this block's data. Null for ordinary in-file GID order.
+  int *restart_gid_eachmb;
 
   // following 2x arrays allocated with length [nranks] in BuildTreeFromXXXX()
   int *gids_eachrank;      // starting global ID of MeshBlocks in each rank
@@ -139,27 +253,41 @@ class Mesh {
   // following 1x arrays allocated with length [nranks] in AddCoordinatesAndPhysics()
   int *nprtcl_eachrank;    // number of particles on each rank
 
-  Real time, dt, dtold, dt_last_completed, dt_parabolic_sts, sts_max_dt_ratio, cfl_no;
-  parabolic::STSIntegrator sts_integrator;
+  Real time, dt, dtold, dt_last_completed, cfl_no;
   int ncycle;
   EventCounters ecounter;
 
   int nmb_packs_thisrank;                  // number of MBPacks on this rank
-  MeshBlockPack* pmb_pack;                 // container for MeshBlocks on this rank
+  MeshBlockPack* pmb_pack = nullptr;       // container for MeshBlocks on this rank
   std::unique_ptr<ProblemGenerator> pgen;  // class containing functions to set ICs
   MeshRefinement *pmr=nullptr;             // mesh refinement data/functions (if needed)
-  CyclicZoom *pzoom=nullptr;               // cyclic zoom data/functions (if needed)
 
   // functions
   void BuildTreeFromScratch(ParameterInput *pin);
   void BuildTreeFromRestart(ParameterInput *pin, IOWrapper &resfile,
                             bool single_file_per_rank=false);
+  // The inputs of the LAT block->rank cost model a partition is balanced for: the factor
+  // ladder depth (UpdateHydroLATMetadata).  "none" without LAT.
+  static std::string HydroLATCostModel(ParameterInput *pin);
   void PrintMeshDiagnostics();
   void WriteMeshStructure();
   void NewTimeStep(const Real tlim);
-  void RefreshSTSParabolicTimeStep();
+  void UpdateHydroLATMetadata(int max_factor);
+  void InvalidateHydroLATMetadata();
+  bool HydroLATLoadBalanceCurrent() const {
+    return hydro_lat_metadata_valid &&
+           hydro_lat_metadata_topology_version == topology_version &&
+           hydro_lat_lb_topology_version == topology_version &&
+           hydro_lat_lb_metadata_version == hydro_lat_metadata_version &&
+           hydro_lat_lb_work_version == hydro_lat_work_version;
+  }
+  void StampHydroLATLoadBalanceVersions() {
+    hydro_lat_lb_topology_version = topology_version;
+    hydro_lat_lb_metadata_version = hydro_lat_metadata_version;
+    hydro_lat_lb_work_version = hydro_lat_work_version;
+  }
+  int HydroLATFactorForGID(int gid, int max_factor) const;
   void AddCoordinatesAndPhysics(ParameterInput *pinput);
-  void AddCyclicZoom(ParameterInput *pin);
   BoundaryFlag GetBoundaryFlag(const std::string& input_string);
   std::string GetBoundaryString(BoundaryFlag input_flag);
 
@@ -169,24 +297,25 @@ class Mesh {
   }
 
   // accessors
-  int FindMeshBlockIndex(int tgid) {
-    for (int m=0; m<pmb_pack->nmb_thispack; ++m) {
-      if (pmb_pack->pmb->mb_gid.h_view(m) == tgid) return m;
-    }
-    return -1;
-  }
+  int FindMeshBlockIndex(int tgid);
   int NumberOfMeshBlockCells() const {
     return (mb_indcs.nx1)*(mb_indcs.nx2)*(mb_indcs.nx3);
   }
-  // Monotonic counter of mesh-topology update events (AMR and any resulting load
-  // balancing). Used by the rank-packed boundary communication path to detect when
-  // its cached communication metadata must be rebuilt.
-  void MarkMeshUpdated() { ++amr_lb_seq_; }
-  int GetAMRLoadBalanceUpdateSeq() const { return amr_lb_seq_; }
+
+  // Public because it launches a device lambda: CUDA rejects extended lambdas inside
+  // private or protected member functions.
+  void ApplyHydroLATDensityPin();
 
  private:
   std::unique_ptr<MeshBlockTree> ptree;  // pointer to root node in binary/quad/oct-tree
-  void LoadBalance(float *clist, int *rlist, int *slist, int *nlist, int nb);
-  int amr_lb_seq_ = 0;
+  void LoadBalance(float *clist, int *rlist, int *slist, int *nlist, int nb,
+                   int max_blocks_per_rank=0);
+  int ApplyHydroLATLoadBalanceCosts(ParameterInput *pin, LogicalLocation *lloc_list,
+                                    float *cost_list, int nb, int *lat_factor_list=nullptr,
+                                    int *lat_sync_factor=nullptr,
+                                    bool costs_measured=false);
+  void ApplyHydroLATGIDMapToArrays(LogicalLocation *lloc_list, float *cost_list,
+                                   int *lat_factor_list, int **restart_gid_map,
+                                   int nb, const int *newtoold, bool reordered);
 };
 #endif  // MESH_MESH_HPP_

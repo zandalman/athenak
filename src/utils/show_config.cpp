@@ -9,6 +9,7 @@
 #include <sstream>
 
 #include "athena.hpp"
+#include "pgen/problem_name.hpp"
 
 //----------------------------------------------------------------------------------------
 //! \fn void ShowConfig()
@@ -16,7 +17,7 @@
 
 void ShowConfig() {
   std::cout<<"This Athena++ executable is configured with:" << std::endl;
-  std::cout<<"  Problem generator:          " << PROBLEM_GENERATOR << std::endl;
+  std::cout<<"  Problem generator:          " << ProblemGeneratorName() << std::endl;
   if (SINGLE_PRECISION_ENABLED) {
     std::cout<<"  Floating-point precision:   single" << std::endl;
   } else {

@@ -1,0 +1,105 @@
+# AthenaK input file for self-gravitating polytropic star
+
+<comment>
+problem = PolytropicStar
+
+<job>
+basename = PolytropicStar
+
+<mesh>
+nghost = 4
+nx1 = 64
+x1min = -1.0
+x1max = 1.0
+ix1_bc = periodic
+ox1_bc = periodic
+
+nx2 = 64
+x2min = -1.0
+x2max = 1.0
+ix2_bc = periodic
+ox2_bc = periodic
+
+nx3 = 64
+x3min = -1.0
+x3max = 1.0
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 32
+nx2 = 32
+nx3 = 32
+
+<mesh_refinement>
+refinement = adaptive
+num_levels = 2
+max_nmb_per_rank = 2048
+ncycle_check = 1
+refinement_interval = 1
+
+<amr_criterion0>
+method = user
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.2
+nlim = 100
+tlim = 0.2
+ndiag = 1
+
+<hydro>
+eos = ideal
+reconstruct = plm
+rsolver = llf
+# For polytropic consistency, set gamma = 1 + 1/n.
+# Here n=1.0, so gamma must be 2.0.
+gamma = 2.0
+
+<gravity>
+four_pi_G = 1.0
+threshold = 0.0
+npresmooth = 2
+npostsmooth = 2
+full_multigrid = true
+fmg_ncycle = 2
+show_defect = true
+subtract_average = true
+
+<hydro_srcterms>
+self_gravity = true
+
+<problem>
+pgen_name = polytropic_star
+rho_central = 1.0
+star_radius = 0.5
+rho_floor = 1.0e-6
+poly_n = 1.0
+# poly_K is derived numerically from Lane-Emden n, rho_central, star_radius, and four_pi_G.
+# Standard setup: exact hydrostatic support + temporary velocity damping.
+pressure_support = 1.0
+# Temporary relaxation to damp truncation-error motions and settle discrete HSE.
+relax_damp = true
+relax_tau = 0.01
+relax_t_end = 0.05
+relax_radius = 0.5
+amp = 0.0
+x_center = 0.0
+y_center = 0.0
+z_center = 0.0
+njeans = 16.0
+
+<output1>
+file_type = hst
+dt = 0.001
+
+<output2>
+file_type = bin
+variable = hydro_w
+dt = 0.01
+
+<output3>
+file_type = bin
+variable = grav_phi
+dt = 0.01

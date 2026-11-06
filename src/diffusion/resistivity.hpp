@@ -14,7 +14,6 @@
 //  either parameter triggers construction of this class in the MHD constructor.
 
 #include "athena.hpp"
-#include "diffusion/sts_types.hpp"
 #include "parameter_input.hpp"
 #include "mesh/meshblock.hpp"
 
@@ -32,13 +31,12 @@ class Resistivity {
   Real dtnew;
   Real eta_ohm;   // Ohmic resistivity coefficient (0 => Ohmic term off)
   Real eta_ad;    // ambipolar diffusion coefficient (0 => ambipolar term off)
-  parabolic::DiffusionSelection mode =
-      parabolic::DiffusionSelection::explicit_only;
 
   // wrapper functions: add non-ideal E-Field and energy (Poynting) flux. Each dispatches
   // to the Ohmic and/or ambipolar implementations depending on which coefficients are on.
   void AddResistiveEMFs(const DvceFaceFld4D<Real> &b0, DvceEdgeFld4D<Real> &efld);
-  void AddResistiveFluxes(const DvceFaceFld4D<Real> &b0, DvceFaceFld5D<Real> &flx);
+  // The MHD flux register is taken on its storage band (mhd.hpp FluxBand).
+  void AddResistiveFluxes(const DvceFaceFld4D<Real> &b0, const BandFaceFld5D<Real> &flx);
   void NewTimeStep(const DvceArray5D<Real> &w, const EOS_Data &eos_data);
 
   // Implementation kernels. These MUST be public: each launches Kokkos par_for kernels,
@@ -47,11 +45,13 @@ class Resistivity {
   // Matches main, where the Ohmic implementations are also public.
   // Ohmic resistivity (constant coefficient): E = eta_ohm * J
   void AddEMFConstantResist(const DvceFaceFld4D<Real> &b0, DvceEdgeFld4D<Real> &efld);
-  void AddFluxConstantResist(const DvceFaceFld4D<Real> &b, DvceFaceFld5D<Real> &flx);
+  void AddFluxConstantResist(const DvceFaceFld4D<Real> &b,
+      const BandFaceFld5D<Real> &flx);
 
   // Ambipolar diffusion (constant coefficient): E = eta_ad * [B^2 J - (J.B) B].
   void AddEMFConstantAmbipolar(const DvceFaceFld4D<Real> &b0, DvceEdgeFld4D<Real> &efld);
-  void AddFluxConstantAmbipolar(const DvceFaceFld4D<Real> &b0, DvceFaceFld5D<Real> &flx);
+  void AddFluxConstantAmbipolar(const DvceFaceFld4D<Real> &b0,
+                                const BandFaceFld5D<Real> &flx);
 
  private:
   MeshBlockPack* pmy_pack;

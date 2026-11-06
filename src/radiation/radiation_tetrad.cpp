@@ -40,8 +40,7 @@ void Radiation::SetOrthonormalTetrad() {
   auto nh_c_ = nh_c;
 
   auto &coord = pmy_pack->pcoord->coord_data;
-  bool &flat = coord.is_minkowski;
-  Real &spin = coord.bh_spin;
+  const KerrHole hole = coord.Hole();
 
   // define tetrad frame
   for (int n=0; n<=nang1; ++n) {
@@ -87,11 +86,11 @@ void Radiation::SetOrthonormalTetrad() {
     Real x3v = CellCenterX(k-ks, indcs.nx3, x3min, x3max);
 
     Real glower[4][4], gupper[4][4];
-    ComputeMetricAndInverse(x1v,x2v,x3v,flat,spin,glower,gupper);
+    ComputeMetricAndInverse(x1v,x2v,x3v,hole,glower,gupper);
     Real dgx[4][4], dgy[4][4], dgz[4][4];
-    ComputeMetricDerivatives(x1v,x2v,x3v,flat,spin,dgx,dgy,dgz);
+    ComputeMetricDerivatives(x1v,x2v,x3v,hole,dgx,dgy,dgz);
     Real e[4][4], e_cov[4][4], omega[4][4][4];
-    ComputeTetrad(x1v,x2v,x3v,flat,spin,glower,gupper,dgx,dgy,dgz,e,e_cov,omega);
+    ComputeTetrad(x1v,x2v,x3v,hole,glower,gupper,dgx,dgy,dgz,e,e_cov,omega);
     for (int d1=0; d1<4; ++d1) {
       for (int d2=0; d2<4; ++d2) {
         tet_c_   (m,d1,d2,k,j,i) = e[d1][d2];
@@ -117,11 +116,11 @@ void Radiation::SetOrthonormalTetrad() {
     Real x3v = CellCenterX(k-ks, indcs.nx3, x3min, x3max);
 
     Real glower[4][4], gupper[4][4];
-    ComputeMetricAndInverse(x1f,x2v,x3v,flat,spin,glower,gupper);
+    ComputeMetricAndInverse(x1f,x2v,x3v,hole,glower,gupper);
     Real dgx[4][4], dgy[4][4], dgz[4][4];
-    ComputeMetricDerivatives(x1f,x2v,x3v,flat,spin,dgx,dgy,dgz);
+    ComputeMetricDerivatives(x1f,x2v,x3v,hole,dgx,dgy,dgz);
     Real e[4][4], e_cov[4][4], omega[4][4][4];
-    ComputeTetrad(x1f,x2v,x3v,flat,spin,glower,gupper,dgx,dgy,dgz,e,e_cov,omega);
+    ComputeTetrad(x1f,x2v,x3v,hole,glower,gupper,dgx,dgy,dgz,e,e_cov,omega);
     for (int d=0; d<4; ++d) { tet_d1_x1f_(m,d,k,j,i) = e[d][1]; }
   });
 
@@ -142,11 +141,11 @@ void Radiation::SetOrthonormalTetrad() {
     Real x3v = CellCenterX(k-ks, indcs.nx3, x3min, x3max);
 
     Real glower[4][4], gupper[4][4];
-    ComputeMetricAndInverse(x1v,x2f,x3v,flat,spin,glower,gupper);
+    ComputeMetricAndInverse(x1v,x2f,x3v,hole,glower,gupper);
     Real dgx[4][4], dgy[4][4], dgz[4][4];
-    ComputeMetricDerivatives(x1v,x2f,x3v,flat,spin,dgx,dgy,dgz);
+    ComputeMetricDerivatives(x1v,x2f,x3v,hole,dgx,dgy,dgz);
     Real e[4][4], e_cov[4][4], omega[4][4][4];
-    ComputeTetrad(x1v,x2f,x3v,flat,spin,glower,gupper,dgx,dgy,dgz,e,e_cov,omega);
+    ComputeTetrad(x1v,x2f,x3v,hole,glower,gupper,dgx,dgy,dgz,e,e_cov,omega);
     for (int d=0; d<4; ++d) { tet_d2_x2f_(m,d,k,j,i) = e[d][2]; }
   });
 
@@ -167,11 +166,11 @@ void Radiation::SetOrthonormalTetrad() {
     Real x3f = LeftEdgeX(k-ks, indcs.nx3, x3min, x3max);
 
     Real glower[4][4], gupper[4][4];
-    ComputeMetricAndInverse(x1v,x2v,x3f,flat,spin,glower,gupper);
+    ComputeMetricAndInverse(x1v,x2v,x3f,hole,glower,gupper);
     Real dgx[4][4], dgy[4][4], dgz[4][4];
-    ComputeMetricDerivatives(x1v,x2v,x3f,flat,spin,dgx,dgy,dgz);
+    ComputeMetricDerivatives(x1v,x2v,x3f,hole,dgx,dgy,dgz);
     Real e[4][4], e_cov[4][4], omega[4][4][4];
-    ComputeTetrad(x1v,x2v,x3f,flat,spin,glower,gupper,dgx,dgy,dgz,e,e_cov,omega);
+    ComputeTetrad(x1v,x2v,x3f,hole,glower,gupper,dgx,dgy,dgz,e,e_cov,omega);
     for (int d=0; d<4; ++d) { tet_d3_x3f_(m,d,k,j,i) = e[d][3]; }
   });
 
@@ -195,11 +194,11 @@ void Radiation::SetOrthonormalTetrad() {
       Real x3v = CellCenterX(k-ks, indcs.nx3, x3min, x3max);
 
       Real glower[4][4], gupper[4][4];
-      ComputeMetricAndInverse(x1v,x2v,x3v,flat,spin,glower,gupper);
+      ComputeMetricAndInverse(x1v,x2v,x3v,hole,glower,gupper);
       Real dgx[4][4], dgy[4][4], dgz[4][4];
-      ComputeMetricDerivatives(x1v,x2v,x3v,flat,spin,dgx,dgy,dgz);
+      ComputeMetricDerivatives(x1v,x2v,x3v,hole,dgx,dgy,dgz);
       Real e[4][4], e_cov[4][4], omega[4][4][4];
-      ComputeTetrad(x1v,x2v,x3v,flat,spin,glower,gupper,dgx,dgy,dgz,e,e_cov,omega);
+      ComputeTetrad(x1v,x2v,x3v,hole,glower,gupper,dgx,dgy,dgz,e,e_cov,omega);
       for (int n=0; n<=nang1; ++n) {
         for (int nb=0; nb<num_neighbors_.d_view(n); ++nb) {
           Real iszetaf = 1.0/sqrt(1.0 - SQR(nh_f_.d_view(n,nb,3)));
@@ -237,11 +236,11 @@ void Radiation::SetOrthonormalTetrad() {
       Real x3v = CellCenterX(k-ks, indcs.nx3, x3min, x3max);
 
       Real glower[4][4], gupper[4][4];
-      ComputeMetricAndInverse(x1v,x2v,x3v,flat,spin,glower,gupper);
+      ComputeMetricAndInverse(x1v,x2v,x3v,hole,glower,gupper);
       Real dgx[4][4], dgy[4][4], dgz[4][4];
-      ComputeMetricDerivatives(x1v,x2v,x3v,flat,spin,dgx,dgy,dgz);
+      ComputeMetricDerivatives(x1v,x2v,x3v,hole,dgx,dgy,dgz);
       Real e[4][4], e_cov[4][4], omega[4][4][4];
-      ComputeTetrad(x1v,x2v,x3v,flat,spin,glower,gupper,dgx,dgy,dgz,e,e_cov,omega);
+      ComputeTetrad(x1v,x2v,x3v,hole,glower,gupper,dgx,dgy,dgz,e,e_cov,omega);
 
       // Minkowski metric
       Real eta[4][4] = {};

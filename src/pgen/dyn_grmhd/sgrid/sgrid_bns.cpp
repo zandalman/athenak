@@ -350,6 +350,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     std::cout << "Data copied." << std::endl;
 
   // TODO(JMF): Add magnetic fields
+  pmbp->pmhd->RequireField("The SGRID BNS problem generator");
   auto &b0 = pmbp->pmhd->b0;
   par_for(
       "pgen_Bfc", DevExeSpace(), 0, nmb - 1, ks, ke, js, je, is, ie,

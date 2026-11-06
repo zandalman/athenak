@@ -71,11 +71,7 @@ Real Extrapolate<4>(DvceArray5D<Real> u, const int m, const int n,
 
 //----------------------------------------------------------------------------------------
 //! \fn void MeshBoundaryValues::Z4cBCs()
-//! \brief Apply physical boundary conditions for all Z4c variables on the fine array at
-//  faces of the MB which are at the edge of the computational domain. This is applied
-//  *after* prolongation (see Z4c::Prolongate / Z4c::ApplyPhysicalBCs), so that the
-//  corner ghost zones between a coarse neighbor and a physical boundary -- which are
-//  filled by extrapolation from the coarse/fine interface ghosts -- read valid data.
+//! \brief Apply physical boundary conditions to the fine array after prolongation.
 void MeshBoundaryValues::Z4cBCs(MeshBlockPack *ppack, DualArray2D<Real> u_in,
                                 DvceArray5D<Real> u0) {
   auto &indcs = ppack->pmesh->mb_indcs;
@@ -107,33 +103,27 @@ void MeshBoundaryValues::Z4cBCs(MeshBlockPack *ppack, DualArray2D<Real> u_in,
 
 //----------------------------------------------------------------------------------------
 //! \fn void MeshBoundaryValues::Z4cBCsCoarse()
-//! \brief Apply physical boundary conditions for all Z4c variables on the coarse array.
-//  This must be done *before* prolongation so that the prolongation stencil has valid
-//  data in the coarse ghost zones that sit at a physical boundary.
+//! \brief Fill coarse physical-boundary ghosts before prolongation.
 void MeshBoundaryValues::Z4cBCsCoarse(MeshBlockPack *ppack, DualArray2D<Real> u_in,
                                       DvceArray5D<Real> coarse_u0) {
   auto &indcs = ppack->pmesh->mb_indcs;
   int &ng = indcs.ng;
   auto &opt = ppack->pz4c->opt;
-
-  int cn1 = indcs.cnx1 + 2*ng;
-  int cn2 = (indcs.cnx2 > 1)? (indcs.cnx2 + 2*ng) : 1;
-  int cn3 = (indcs.cnx3 > 1)? (indcs.cnx3 + 2*ng) : 1;
-  int cis = indcs.cis;
-  int cie = indcs.cie;
-  int cjs = indcs.cjs;
-  int cje = indcs.cje;
-  int cks = indcs.cks;
-  int cke = indcs.cke;
+  int n1 = indcs.cnx1 + 2*ng;
+  int n2 = (indcs.cnx2 > 1)? (indcs.cnx2 + 2*ng) : 1;
+  int n3 = (indcs.cnx3 > 1)? (indcs.cnx3 + 2*ng) : 1;
   switch(opt.extrap_order) {
     case 2:
-      BCHelper<2>(ppack, u_in, coarse_u0, cis, cie, cjs, cje, cks, cke, cn1, cn2, cn3);
+      BCHelper<2>(ppack, u_in, coarse_u0, indcs.cis, indcs.cie, indcs.cjs,
+                  indcs.cje, indcs.cks, indcs.cke, n1, n2, n3);
       break;
     case 3:
-      BCHelper<3>(ppack, u_in, coarse_u0, cis, cie, cjs, cje, cks, cke, cn1, cn2, cn3);
+      BCHelper<3>(ppack, u_in, coarse_u0, indcs.cis, indcs.cie, indcs.cjs,
+                  indcs.cje, indcs.cks, indcs.cke, n1, n2, n3);
       break;
     case 4:
-      BCHelper<4>(ppack, u_in, coarse_u0, cis, cie, cjs, cje, cks, cke, cn1, cn2, cn3);
+      BCHelper<4>(ppack, u_in, coarse_u0, indcs.cis, indcs.cie, indcs.cjs,
+                  indcs.cje, indcs.cks, indcs.cke, n1, n2, n3);
       break;
   }
 }
@@ -170,6 +160,7 @@ void BCHelper(MeshBlockPack *ppack, DualArray2D<Real> u_in, DvceArray5D<Real> u0
           }
           break;
         case BoundaryFlag::diode:
+        case BoundaryFlag::outflow_only:  // non-hydro fields: as outflow
         case BoundaryFlag::outflow:
         case BoundaryFlag::vacuum:
           for (int i=0; i<ng; ++i) {
@@ -200,6 +191,7 @@ void BCHelper(MeshBlockPack *ppack, DualArray2D<Real> u_in, DvceArray5D<Real> u0
           }
           break;
         case BoundaryFlag::diode:
+        case BoundaryFlag::outflow_only:  // non-hydro fields: as outflow
         case BoundaryFlag::outflow:
         case BoundaryFlag::vacuum:
           for (int i=0; i<ng; ++i) {
@@ -238,6 +230,7 @@ void BCHelper(MeshBlockPack *ppack, DualArray2D<Real> u_in, DvceArray5D<Real> u0
           }
           break;
         case BoundaryFlag::diode:
+        case BoundaryFlag::outflow_only:  // non-hydro fields: as outflow
         case BoundaryFlag::outflow:
         case BoundaryFlag::vacuum:
           for (int j=0; j<ng; ++j) {
@@ -268,6 +261,7 @@ void BCHelper(MeshBlockPack *ppack, DualArray2D<Real> u_in, DvceArray5D<Real> u0
           }
           break;
         case BoundaryFlag::diode:
+        case BoundaryFlag::outflow_only:  // non-hydro fields: as outflow
         case BoundaryFlag::outflow:
         case BoundaryFlag::vacuum:
           for (int j=0; j<ng; ++j) {
@@ -305,6 +299,7 @@ void BCHelper(MeshBlockPack *ppack, DualArray2D<Real> u_in, DvceArray5D<Real> u0
         }
         break;
       case BoundaryFlag::diode:
+      case BoundaryFlag::outflow_only:  // non-hydro fields: as outflow
       case BoundaryFlag::outflow:
       case BoundaryFlag::vacuum:
         for (int k=0; k<ng; ++k) {
@@ -335,6 +330,7 @@ void BCHelper(MeshBlockPack *ppack, DualArray2D<Real> u_in, DvceArray5D<Real> u0
         }
         break;
       case BoundaryFlag::diode:
+      case BoundaryFlag::outflow_only:  // non-hydro fields: as outflow
       case BoundaryFlag::outflow:
       case BoundaryFlag::vacuum:
         for (int k=0; k<ng; ++k) {

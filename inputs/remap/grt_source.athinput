@@ -1,0 +1,117 @@
+<comment>
+problem = remap battery: fixed-metric GR (kFixedGR) MHD source.  Miniature version of
+inputs/grmhd/gr_fm_torus_sane_8_4.athinput: same Kerr background (a = 0.9375, excision
+on) and the same Fishbone-Moncrief SANE torus, shrunk to a single static refinement
+level so a source restart is produced in ~30 cycles on one GPU.  Written by the GT_*
+phases of the remap test battery.
+
+Two restarts are produced: file 00000 at t = 0 (every fresh run dumps all outputs before
+the main loop) and file 00001 at the end of the run (Driver::Finalize always writes a
+final dump).  The battery remaps from the LAST one so the source time is nonzero.
+
+<job>
+basename = GRTSrc
+
+<mesh>
+nghost = 4        # ppm4 + the ng=4 path the GR restarts use
+nx1    = 48
+x1min  = -48.0
+x1max  = 48.0
+ix1_bc = user     # gr_torus enrolls NoInflowTorus
+ox1_bc = user
+
+nx2    = 48
+x2min  = -48.0
+x2max  = 48.0
+ix2_bc = user
+ox2_bc = user
+
+nx3    = 48
+x3min  = -48.0
+x3max  = 48.0
+ix3_bc = user
+ox3_bc = user
+
+<meshblock>
+nx1 = 16
+nx2 = 16
+nx3 = 16
+
+<mesh_refinement>
+refinement = static
+num_levels = 2
+
+<refined_region0>
+# Parity trick, same as inputs/remap/mhd_source_smr.athinput: build_tree.cpp rounds the
+# covered level-1 block range down/up to an even/odd pair, so a level-1 region always
+# widens to WHOLE root blocks.  48^3 cells in 16^3 blocks = 3 root blocks per dimension
+# ([-48,-16], [-16,16], [16,48]); level-1 slots span 16 units each.  The region below
+# selects slot 2 per dimension, which widens to slots 2..3 = exactly the CENTRAL root
+# block [-16,16]^3.  One root block refines, 26 stay coarse, and real fine/coarse
+# interfaces exist at the +/-16 planes (a region straddling the centre would widen to the
+# whole mesh and the SMR gates would measure nothing).
+level = 1
+x1min = -12.0
+x1max = 0.0
+x2min = -12.0
+x2max = 0.0
+x3min = -12.0
+x3max = 0.0
+
+<time>
+evolution  = dynamic
+integrator = rk2
+cfl_number = 0.3
+nlim       = 30
+tlim       = 100000.0
+ndiag      = 1
+
+<coord>
+general_rel = true       # kFixedGR: <coord> general_rel, no <adm> block
+a           = 0.9375
+excise      = true
+dexcise     = 1.0e-10
+pexcise     = 0.333e-12
+
+<mhd>
+eos         = ideal
+reconstruct = ppm4
+rsolver     = hlle
+dfloor      = 1.0e-10
+pfloor      = 0.333e-12
+gamma       = 1.3333333333333333
+fofc        = true
+gamma_max   = 20.0
+
+<problem>
+fm_torus   = true
+r_edge     = 6.0
+r_peak     = 12.0
+tilt_angle = 0.0
+potential_beta_min = 100.0
+potential_cutoff   = 0.2
+potential_rho_pow  = 1.0
+rho_min   = 1.0e-5
+rho_pow   = -1.5
+pgas_min  = 0.333e-7
+pgas_pow  = -2.5
+rho_max   = 1.0
+l         = 0.0
+# Deterministic ICs: the battery compares the remapped state against the source state, so
+# no random seed perturbation (the production torus uses 2e-2).
+pert_amp  = 0.0
+user_hist = false
+
+<output1>
+file_type = rst
+dt        = 100000.0   # t=0 dump + the unconditional Driver::Finalize dump only
+
+<output2>
+file_type = bin
+variable  = mhd_w_bcc
+dt        = 100000.0
+
+<output3>
+file_type = bin
+variable  = mhd_divb
+dt        = 100000.0

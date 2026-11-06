@@ -1,0 +1,72 @@
+<comment>
+problem = streams colliding at 7 c along x2 into a sheet carried at 1000 c along x1, uniform gravity along x1, dual energy (hydro deck of test_nr_mhd_dual_hydro_parity_cpu.py, which writes the MHD deck from it)
+
+<job>
+basename = sheet
+
+<mesh>
+nghost = 2
+nx1    = 16
+x1min  = 0.0
+x1max  = 0.125
+ix1_bc = periodic
+ox1_bc = periodic
+nx2    = 64
+x2min  = -0.25
+x2max  = 0.25
+ix2_bc = outflow
+ox2_bc = outflow
+nx3    = 1
+x3min  = -0.5
+x3max  = 0.5
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 16
+nx2 = 64
+nx3 = 1
+
+<time>
+evolution  = dynamic
+integrator = rk2
+cfl_number = 0.4
+nlim       = 2000
+tlim       = 1.0
+ndiag      = 100000
+
+<hydro>
+eos              = ideal
+reconstruct      = plm
+rsolver          = hlle
+gamma            = 1.6666666666667
+dual_energy      = true
+dual_energy_eta1 = 1.0e-3
+dfloor           = 1.0e-10
+pfloor           = 1.0e-12
+
+<hydro_srcterms>
+const_accel     = true
+const_accel_val = 4800
+const_accel_dir = 1
+
+<problem>
+pgen_name = shock_tube
+shock_dir = 2
+xshock    = 0.0
+dl        = 1.0
+pl        = 0.6
+ul        = 7.0
+vl        = 0.0
+wl        = 1000.0
+dr        = 1.0
+pr        = 0.6
+ur        = -7.0
+vr        = 0.0
+wr        = 1000.0
+
+<output1>
+file_type = bin
+variable  = hydro_w
+variable_precision = float64
+dcycle    = 2000

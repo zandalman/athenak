@@ -1,4 +1,4 @@
-# AthenaK input file for Bondi accretion
+# Athena++ (Kokkos version) input file for Bondi accretion
 
 <comment>
 problem   = GR hydro accretion in radial direction

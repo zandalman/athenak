@@ -29,7 +29,8 @@
 namespace Primitive {
 
 template<typename LogPolicy>
-class EOSHybrid : public EOSPolicyInterface, public LogPolicy {
+class EOSHybrid : public EOSPolicyInterface, public LogPolicy,
+                  public SupportsGasEntropy {
  private:
   using LogPolicy::log2_;
   using LogPolicy::exp2_;
@@ -143,6 +144,19 @@ class EOSHybrid : public EOSPolicyInterface, public LogPolicy {
   /// Calculate the specific internal energy per unit mass.
   KOKKOS_INLINE_FUNCTION Real SpecificInternalEnergy(Real n, Real T, Real *Y) const {
     return Energy(n, T, Y)/(mb*n) - 1;
+  }
+
+  /// The thermal adiabat ln(p_th/rho^Gamma_th)/(Gamma_th - 1), p_th = n T, rho = n mb.
+  /// The cold part is the zero-temperature barotrope, adiabatic by itself, so the first
+  /// law at zero heat, d e = (e + p) dn/n, leaves d e_th = (e_th + p_th) dn/n: e_th and
+  /// p_th scale as n^Gamma_th along an adiabat and this label is constant there.
+  KOKKOS_INLINE_FUNCTION Real GasEntropy(Real n, Real T, Real *Y) const {
+    return (log(n*T) - gamma_th*log(n*mb))/gamma_th_m1;
+  }
+
+  /// Its inverse at fixed n: p_th = exp((Gamma_th - 1) s) rho^Gamma_th, T = p_th/n.
+  KOKKOS_INLINE_FUNCTION Real TemperatureFromGasEntropy(Real n, Real s, Real *Y) const {
+    return exp(gamma_th_m1*s + gamma_th*log(n*mb))/n;
   }
 
   /// Calculate energy for the cold part.

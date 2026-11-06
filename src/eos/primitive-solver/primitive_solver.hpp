@@ -17,6 +17,7 @@
 // FIXME: Debug only!
 #include <iostream>
 #include <algorithm>
+#include <limits>
 
 #include "numtools_root.hpp"
 
@@ -30,6 +31,9 @@ namespace Primitive {
 template<typename EOSPolicy, typename ErrorPolicy>
 class PrimitiveSolver {
  private:
+  // Rounded operations on the longest chain from the conserved state to the root's
+  // specific internal energy, counted in ConToPrim (SolverResult::energy_unresolved).
+  static constexpr int kEnergyRoundingOps = 15;
   // Inner classes defining functors
   // UpperRootFunctor {{{
   class UpperRootFunctor {
@@ -162,6 +166,77 @@ class PrimitiveSolver {
     }
   };
   // }}}
+
+  // EntropyRootFunctor {{{
+  //! \brief The same Kastaun root function with the temperature taken from the
+  //  transported gas entropy instead of from the conserved energy: KORAL's U2P_ENTROPY
+  //  system (koral_lite u2p.c:2144-2200, f_u2p_entropy), which closes (D, S_i, B^i) with
+  //  the entropy and does not read tau.  It has KORAL's root; it finds it by bracketed
+  //  false position on the bracket of the energy branch instead of KORAL's damped Newton.
+  //
+  //  It differs from RootFunctor in one place: where that one forms
+  //  e/D = q - b^2/2 - ... - mu rbar^2 + 1 and inverts it for T, this one evaluates T
+  //  from (n, s) through the policy's adiabat label (EOS::GetTemperatureFromGasEntropy).
+  //  The label may cover less density than the EOS (the LTE table has none above its last
+  //  density row, where its energy still extrapolates): ConToPrim then raises the lower
+  //  end of the bracket to the mu at which the trial density D/W(mu) reaches the top of
+  //  the label (EOS::GetMaximumGasEntropyDensity), so the trial density stays within it;
+  //  the clamp to that density below only holds that end, set a relative 1e-10 lower in
+  //  mu so that a root on the top row stays bracketed, on the top row.
+  //
+  //  It is a separate functor rather than a branch in RootFunctor because the GR
+  //  inversion kernels are instruction-bound: a runtime flag there would carry both
+  //  code paths through every iteration of every cell.
+  class EntropyRootFunctor {
+   public:
+    KOKKOS_INLINE_FUNCTION
+    Real operator()(Real mu, Real D, Real entropy, Real bsq, Real rsq, Real rbsq,
+        Real *Y, const EOS<EOSPolicy, ErrorPolicy> * peos,
+        Real* n, Real* T, Real* P) const {
+      const Real x = 1.0/(1.0 + mu*bsq);
+      const Real rbarsq = x*(rsq*x + mu*(x + 1.0)*rbsq);
+      const Real mb = peos->GetBaryonMass();
+
+      // Velocity and Lorentz factor: identical to the energy branch, and bounded the
+      // same way.
+      const Real h_min = peos->GetMinimumEnthalpy();
+      const Real vsq_max = Kokkos::fmin(rsq/(h_min*h_min + rsq),
+                                    peos->GetMaxVelocity()*peos->GetMaxVelocity());
+      const Real vhatsq = Kokkos::fmin(mu*mu*rbarsq, vsq_max);
+      const Real iWhat = Kokkos::sqrt(1.0 - vhatsq);
+
+      Real rhohat = D*iWhat;
+      Real nhat = rhohat/mb;
+      peos->ApplyDensityLimits(nhat);
+      nhat = Kokkos::fmin(nhat, peos->GetMaximumGasEntropyDensity());
+
+      // The line that differs from RootFunctor.
+      Real That = peos->GetTemperatureFromGasEntropy(nhat, entropy, Y);
+      if (!(That == That)) {
+        return That;
+      }
+      peos->ApplyTemperatureLimits(That);
+
+      Real ehat = peos->GetEnergy(nhat, That, Y);
+      Real Phat = peos->GetPressure(nhat, That, Y);
+      Real hhat = (ehat + Phat)/(mb*nhat);
+
+      // Both estimates of nu = h/W agree here unless the density limit moved nhat, so
+      // the fmax only guards that case; it is kept for parity with the energy branch.
+      Real nu_a = hhat*iWhat;
+      Real nu_b = (ehat + Phat)/D;
+      Real nuhat = Kokkos::fmax(nu_a, nu_b);
+
+      Real muhat = 1.0/(nuhat + mu*rbarsq);
+
+      *n = nhat;
+      *T = That;
+      *P = Phat;
+
+      return mu - muhat;
+    }
+  };
+  // }}}
  private:
   /// A constant pointer to the EOS.
   /// We make this constant because the
@@ -176,6 +251,7 @@ class PrimitiveSolver {
   UpperRootFunctor UpperRoot;
   MuFromWFunctor MuFromW;
   RootFunctor RootFunction;
+  EntropyRootFunctor EntropyRootFunction;
 
   //! \brief Check and handle the corner case for rho being too small or large.
   //
@@ -218,11 +294,24 @@ class PrimitiveSolver {
   //  \param[in,out] bu    The magnetic field
   //  \param[in]     g3d   The 3x3 spatial metric
   //  \param[in]     g3u   The 3x3 inverse spatial metric
+  //  \param[in]     entropy  The transported gas entropy s (EOS::GetGasEntropy).  A
+  //                       non-finite value (the default NaN) selects the energy root,
+  //                       KORAL's U2P_HOT, and reproduces the original solve exactly; a
+  //                       finite value selects the entropy root, KORAL's U2P_ENTROPY
+  //                       (EntropyRootFunctor), which does not read tau.
+  //  \param[in]     own_state  Invert the cell's own U: no conserved floor.  This is how
+  //                       KORAL's verdict on the hot inversion is read where the ordinary
+  //                       solve had to floor U first.  A tau below that of the gas at the
+  //                       EOS minimum temperature (B^2/2 for the ideal gas, where no state
+  //                       with u >= 0 has it) is reported as cons_floor and not solved.
+  //                       The entropy root always inverts the own U.
   //
   //  \return information about the solve
   KOKKOS_INLINE_FUNCTION
   SolverResult ConToPrim(Real prim[NPRIM], Real cons[NCONS], Real b[NMAG],
-                         Real g3d[NSPMETRIC], Real g3u[NSPMETRIC]) const;
+                         Real g3d[NSPMETRIC], Real g3u[NSPMETRIC],
+                         Real entropy = std::numeric_limits<Real>::quiet_NaN(),
+                         bool own_state = false) const;
 
   //! \brief Get the conserved variables from the primitive variables.
   //
@@ -332,8 +421,10 @@ Error PrimitiveSolver<EOSPolicy, ErrorPolicy>::CheckDensityValid(Real& mul, Real
 template<typename EOSPolicy, typename ErrorPolicy>
 KOKKOS_INLINE_FUNCTION
 SolverResult PrimitiveSolver<EOSPolicy, ErrorPolicy>::ConToPrim(Real prim[NPRIM],
-      Real cons[NCONS], Real b[NMAG], Real g3d[NSPMETRIC], Real g3u[NSPMETRIC]) const {
+      Real cons[NCONS], Real b[NMAG], Real g3d[NSPMETRIC], Real g3u[NSPMETRIC],
+      Real entropy, bool own_state) const {
   SolverResult solver_result{Error::SUCCESS, 0, false, false, false};
+  const bool entropy_root = isfinite(entropy);
 
   // Extract the undensitized conserved variables.
   Real D = cons[CDN];
@@ -341,23 +432,52 @@ SolverResult PrimitiveSolver<EOSPolicy, ErrorPolicy>::ConToPrim(Real prim[NPRIM]
   Real tau = cons[CTA];
   Real B_u[3] = {b[IBX], b[IBY], b[IBZ]};
   // Extract the particle fractions.
+  //
+  // Every species loop below runs to the compile-time MAX_SPECIES and predicates its
+  // body on the runtime count rather than using the count as the trip bound.  A loop
+  // bounded by a runtime value leaves Y[], prim[] and cons[] with runtime-variable
+  // subscripts, which forces all three point arrays into thread-local memory for the
+  // whole kernel; with a constant bound nvcc unrolls, every subscript becomes a
+  // constant, and the arrays stay in registers.  Measured on the dyn-GR ConsToPrim
+  // kernels this removes ~45% of the local-memory instructions across all EOS
+  // policies (most of all for the tabulated ones) at ~5% less code.  The predicate
+  // keeps the semantics identical -- the same elements are written, in the same
+  // order, and MAX_SPECIES is unchanged, so no configuration loses capability.
   const int n_species = eos.GetNSpecies();
   Real Y[MAX_SPECIES] = {0.0};
   // Avoid division by zero.
   if (cons[CDN] > 0 ) {
-    for (int s = 0; s < n_species; s++) {
-      Y[s] = cons[CYD + s]/cons[CDN];
+    #pragma unroll
+    for (int s = 0; s < MAX_SPECIES; s++) {
+      if (s < n_species) Y[s] = cons[CYD + s]/cons[CDN];
     }
   }
   // Apply limits to Y to ensure a physical state
   bool Y_adjusted = eos.ApplySpeciesLimits(Y);
 
-  const Real Bsq = SquareVector(B_u, g3d);
-
   // Check the conserved variables for consistency and do whatever
-  // the EOSPolicy wants us to.
-  bool floored = eos.ApplyConservedFloor(D, S_d, tau, Y, Bsq);
+  // the EOSPolicy wants us to.  The own state is not floored: the entropy root does not
+  // read tau, and an energy root of a tau no gas state at the EOS minimum temperature
+  // reaches is KORAL's u < 0 (koral_lite u2p.c:1328-1333, -104), reported as such.
+  bool floored = false;
+  if (!own_state && !entropy_root) {
+    floored = eos.ApplyConservedFloor(D, S_d, tau, Y, SquareVector(B_u, g3d));
+  } else if (!entropy_root && D > 0.0) {
+    const Real tau_min = eos.GetEnergy(D/eos.GetBaryonMass(),
+                                       eos.GetMinimumTemperature()*
+                                       eos.GetEOSUnitSystem().TemperatureConversion(
+                                           eos.GetCodeUnitSystem()), Y) -
+                         D + 0.5*SquareVector(B_u, g3d);
+    if (tau < tau_min) {
+      solver_result.cons_floor = true;
+      return solver_result;
+    }
+  }
+  // Raised ahead of the root functor, so it describes the conserved state the cell was
+  // handed: the ordinary solve inverted a U that is not the cell's own.
   solver_result.cons_floor = floored;
+  // The floor added rest mass to the cell and kept tau (and S_i): see cons_mass_floor.
+  solver_result.cons_mass_floor = floored && (D > cons[CDN]);
   if (floored && eos.IsConservedFlooringFailure()) {
     HandleFailure(prim, cons, b, g3d);
     solver_result.error = Error::CONS_FLOOR;
@@ -365,8 +485,9 @@ SolverResult PrimitiveSolver<EOSPolicy, ErrorPolicy>::ConToPrim(Real prim[NPRIM]
   }
   // If a floor is applied or Y is adjusted, we need to propagate the changes back to DYe.
   if (floored || Y_adjusted) {
-    for (int s = 0; s < n_species; s++) {
-      cons[CYD + s] = D*Y[s];
+    #pragma unroll
+    for (int s = 0; s < MAX_SPECIES; s++) {
+      if (s < n_species) cons[CYD + s] = D*Y[s];
     }
   }
 
@@ -382,20 +503,23 @@ SolverResult PrimitiveSolver<EOSPolicy, ErrorPolicy>::ConToPrim(Real prim[NPRIM]
   Real bsqr   = SquareVector(b_u, g3d);
   Real q      = tau/D;
 
-  // Make sure there are no NaNs at this point.
-  if (!isfinite(D) || !isfinite(rsqr) || !isfinite(q) ||
+  // Make sure there are no NaNs at this point.  The entropy root reads s, not tau.
+  if (!isfinite(D) || !isfinite(rsqr) || !isfinite(entropy_root ? entropy : q) ||
       !isfinite(rbsqr) || !isfinite(bsqr)) {
     HandleFailure(prim, cons, b, g3d);
     solver_result.error = Error::NANS_IN_CONS;
     return solver_result;
   }
   // We have to check the particle fractions separately.
-  for (int s = 0; s < n_species; s++) {
-    if (!isfinite(Y[s])) {
-      HandleFailure(prim, cons, b, g3d);
-      solver_result.error = Error::NANS_IN_CONS;
-      return solver_result;
-    }
+  bool Y_nan = false;
+  #pragma unroll
+  for (int s = 0; s < MAX_SPECIES; s++) {
+    if (s < n_species && !isfinite(Y[s])) Y_nan = true;
+  }
+  if (Y_nan) {
+    HandleFailure(prim, cons, b, g3d);
+    solver_result.error = Error::NANS_IN_CONS;
+    return solver_result;
   }
 
   // Make sure that the magnetic field is physical.
@@ -408,6 +532,7 @@ SolverResult PrimitiveSolver<EOSPolicy, ErrorPolicy>::ConToPrim(Real prim[NPRIM]
     solver_result.cons_adjusted = true;
     // If b_u is rescaled, we also need to adjust D, which means we'll
     // have to adjust all our other rescalings, too.
+    Real Bsq = SquareVector(B_u, g3d);
     D = Bsq/bsqr;
     r_d[0] = S_d[0]/D; r_d[1] = S_d[1]/D; r_d[2] = S_d[2]/D;
     RaiseForm(r_u, r_d, g3u);
@@ -489,11 +614,51 @@ SolverResult PrimitiveSolver<EOSPolicy, ErrorPolicy>::ConToPrim(Real prim[NPRIM]
     return solver_result;
   }
 
+  // The entropy root reads T from the policy's adiabat label, which may end at a lower
+  // density than the EOS (EOS::GetMaximumGasEntropyDensity: the LTE table has no label
+  // above its last density row, where its energy still extrapolates).  The trial density
+  // D/W(mu) of the root functor falls as mu rises: with r_par the part of r along b,
+  // v^2 = mu^2 rbar^2 = mu^2 r_par^2 + (mu x)^2 (r^2 - r_par^2), and mu x = mu/(1 + mu b^2)
+  // rises with mu.  Where D exceeds that density, the trial densities within the label
+  // are those of the mu at and above the one with W = D/rho_label (MuFromW), so the lower
+  // end of the bracket is raised to it, less a relative 1e-10 as the upper end is
+  // widened, so that a root at the top of the label stays inside (the functor holds the
+  // trial density of that end on the top row).  Where even muh does not reach that W,
+  // the cell's density lies above the label: the entropy root has no answer there.
+  if (entropy_root) {
+    const Real rho_label = eos.GetMaximumGasEntropyDensity()*eos.GetBaryonMass();
+    if (D > rho_label) {
+      const Real W_label = D/rho_label;
+      Real f, df;
+      MuFromW(f, df, muh, bsqr, rsqr, rbsqr, W_label);
+      if (!(f > 0.0)) {
+        HandleFailure(prim, cons, b, g3d);
+        solver_result.error = Error::RHO_TOO_BIG;
+        return solver_result;
+      }
+      Real mulc = mul;
+      Real muhc = muh;
+      Real mu_label = mul;
+      if (!root.NewtonSafe(MuFromW, mulc, muhc, mu_label, 1e-10,
+                           bsqr, rsqr, rbsqr, W_label)) {
+        HandleFailure(prim, cons, b, g3d);
+        solver_result.error = Error::BRACKETING_FAILED;
+        return solver_result;
+      }
+      mul = mu_label*(1. - 1e-10);
+    }
+  }
 
-  // Do the root solve.
+  // Do the root solve.  The upper end of the bracket and the velocity recovery below are
+  // the same for both branches, and so is the lower end unless the entropy branch raised
+  // it above -- only the function whose root is sought differs, because only the
+  // temperature is taken from somewhere else.
   Real n, P, T, mu;
-  bool result = root.FalsePosition(RootFunction, mul, muh, mu, tol,
-                                   D, q, bsqr, rsqr, rbsqr, Y, &eos, &n, &T, &P);
+  bool result = entropy_root
+      ? root.FalsePosition(EntropyRootFunction, mul, muh, mu, tol,
+                           D, entropy, bsqr, rsqr, rbsqr, Y, &eos, &n, &T, &P)
+      : root.FalsePosition(RootFunction, mul, muh, mu, tol,
+                           D, q, bsqr, rsqr, rbsqr, Y, &eos, &n, &T, &P);
   // WARNING: the reported number of iterations is not thread-safe and should only be
   // trusted on single-thread benchmarks.
   solver_result.iterations = root.iterations;
@@ -517,8 +682,61 @@ SolverResult PrimitiveSolver<EOSPolicy, ErrorPolicy>::ConToPrim(Real prim[NPRIM]
   Wv_u[1] = Wmux*(r_u[1] + rbmu*b_u[1]);
   Wv_u[2] = Wmux*(r_u[2] + rbmu*b_u[2]);
 
-  // Apply the flooring policy to the primitive variables.
+  // The enthalpy density the inversion actually recovered.  Everything the floors add
+  // from here on is measured against it, because the drift-frame re-injection that
+  // decides the velocity of the added material needs the state it was added to.  It is
+  // recorded rather than acted on here: the caller applies every bound at once and
+  // re-solves the velocity a single time, so that a cell caught by the atmosphere floor
+  // and the magnetization ceiling in the same step is not rotated twice.
+  solver_result.w_prefloor = n*eos.GetBaryonMass()*eos.GetEnthalpy(n, T, Y);
+  // The same comparison ApplyTemperatureLimits clamps with, in EOS units, so it is exact
+  // where it matters (min_T = 0 for the ideal gas) and false for a NaN minimum.
+  solver_result.energy_at_minimum =
+      T*eos.GetCodeUnitSystem().TemperatureConversion(eos.GetEOSUnitSystem()) <=
+      eos.GetMinimumTemperature();
+  // Whether the energy root holds a significant digit of eps.  The root function forms
+  // e/D = qbar - mu rbar^2 + 1 from sums of magnitude S = |q| + b^2/2 + mu^2 x^2 (b^2 r^2
+  // + rb^2)/2 + mu rbar^2 + 1 (units of D), and the temperature follows from e/(n m_b) =
+  // W e/D, W = D/rho, so rounding alone moves eps = W e/D - 1 by kEnergyRoundingOps
+  // eps_mach W S.  The energy equation's own e/D is judged, not the EOS's round trip of
+  // the temperature (a root held at the temperature limit is energy_at_minimum).  The
+  // operations of the longest chain: x 3, rbar^2 8, qbar 7, mu rbar^2 9, the difference
+  // 10 and the 1 11, e 12; the density D sqrt(1 - mu^2 rbar^2) is 13 and enters the
+  // quotient (14) and the subtraction of 1 (15).  Fused multiply-adds only remove
+  // roundings.  A root of the entropy functor is the transported adiabat, not a solution
+  // of this equation, and is exempt.
+  if (!entropy_root) {
+    const Real x_r = 1.0/(1.0 + mu*bsqr);
+    const Real rbarsq_r = x_r*(rsqr*x_r + mu*(x_r + 1.0)*rbsqr);
+    const Real qbar_r = q - 0.5*bsqr - 0.5*mu*mu*x_r*x_r*(bsqr*rsqr - rbsqr);
+    const Real eoverD_r = qbar_r - mu*rbarsq_r + 1.0;
+    const Real magnitude = fabs(q) + 0.5*bsqr +
+        0.5*mu*mu*x_r*x_r*(bsqr*rsqr + rbsqr) + mu*rbarsq_r + 1.0;
+    const Real W_r = D/(n*eos.GetBaryonMass());
+    solver_result.energy_unresolved = !(W_r*eoverD_r - 1.0 > static_cast<Real>(
+        kEnergyRoundingOps)*std::numeric_limits<Real>::epsilon()*W_r*magnitude);
+  }
+
+  // Apply the flooring policy to the primitive variables.  The policy adds its mass at
+  // the cell's temperature, which is the right temperature for a gas.  In a cell whose
+  // D the conserved floor has just raised (cons_mass_floor) it need not be: for
+  // D << D_floor, T is the leftover tau divided by the floor's mass and has no bound, and
+  // mass added at it carries (added mass) x (that specific energy) of heat nothing paid
+  // for.  In every such cell the added mass therefore comes cold, as the conserved
+  // floor's own did: the internal energy density is kept and T re-solved from it, at
+  // least T_atm.
+  const Real rho_prefloor = n*eos.GetBaryonMass();
+  const Real u_prefloor = solver_result.cons_mass_floor ?
+      eos.GetEnergy(n, T, Y) - rho_prefloor : 0.0;
   floored = eos.ApplyPrimitiveFloor(n, Wv_u, P, T, Y);
+  if (floored && solver_result.cons_mass_floor && n*eos.GetBaryonMass() > rho_prefloor) {
+    T = fmax(eos.GetTemperatureFromE(n, n*eos.GetBaryonMass() + u_prefloor, Y),
+             eos.GetTemperatureFloor());
+    P = eos.GetPressure(n, T, Y);
+  }
+  // The counterpart of cons_floor above: this one is measured on the state the root solve
+  // just recovered, so it belongs to that root alone and is meaningless for a channel
+  // whose answer was thrown away.
   solver_result.prim_floor = floored;
   if (floored && eos.IsPrimitiveFlooringFailure()) {
     HandleFailure(prim, cons, b, g3d);
@@ -527,6 +745,14 @@ SolverResult PrimitiveSolver<EOSPolicy, ErrorPolicy>::ConToPrim(Real prim[NPRIM]
   }
   solver_result.cons_adjusted = solver_result.cons_adjusted || floored ||
                                 solver_result.cons_floor || Y_adjusted;
+  // A root that leaves a non-finite primitive is no solution: report it rather than
+  // publish it (the conserved state was checked above).
+  if (!(isfinite(n) && isfinite(P) && isfinite(T) && isfinite(Wv_u[0]) &&
+        isfinite(Wv_u[1]) && isfinite(Wv_u[2]))) {
+    HandleFailure(prim, cons, b, g3d);
+    solver_result.error = Error::NO_SOLUTION;
+    return solver_result;
+  }
 
   prim[PRH] = n;
   prim[PPR] = P;
@@ -534,8 +760,9 @@ SolverResult PrimitiveSolver<EOSPolicy, ErrorPolicy>::ConToPrim(Real prim[NPRIM]
   prim[PVX] = Wv_u[0];
   prim[PVY] = Wv_u[1];
   prim[PVZ] = Wv_u[2];
-  for (int s = 0; s < n_species; s++) {
-    prim[PYF + s] = Y[s];
+  #pragma unroll
+  for (int s = 0; s < MAX_SPECIES; s++) {
+    if (s < n_species) prim[PYF + s] = Y[s];
   }
 
   // If we floored the primitive variables, we should check
@@ -564,8 +791,9 @@ Error PrimitiveSolver<EOSPolicy, ErrorPolicy>::PrimToCon(Real prim[NPRIM],
   const Real B_u[3] = {bu[IBX], bu[IBY], bu[IBZ]};
   const int n_species = eos.GetNSpecies();
   Real Y[MAX_SPECIES] = {0.0};
-  for (int s = 0; s < n_species; s++) {
-    Y[s] = prim[PYF + s];
+  #pragma unroll
+  for (int s = 0; s < MAX_SPECIES; s++) {
+    if (s < n_species) Y[s] = prim[PYF + s];
   }
 
   // Note that Athena passes in Wv, not v.
@@ -601,8 +829,9 @@ Error PrimitiveSolver<EOSPolicy, ErrorPolicy>::PrimToCon(Real prim[NPRIM],
   Real H = n*eos.GetEnthalpy(n, t, Y)*mb;
   Real HWsq = H*Wsq;
   D = n*mb*W;
-  for (int s = 0; s < n_species; s++) {
-    cons[CYD + s]= D*Y[s];
+  #pragma unroll
+  for (int s = 0; s < MAX_SPECIES; s++) {
+    if (s < n_species) cons[CYD + s] = D*Y[s];
   }
   Real HWsqpb = HWsq + Bsq;
   Sx = (HWsqpb*v_d[0] - Bv*B_d[0]);

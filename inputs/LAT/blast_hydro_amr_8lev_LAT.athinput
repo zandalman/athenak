@@ -1,0 +1,92 @@
+# AthenaK input file for 2D spherical blast with 8-level AMR
+# Requires a build configured with -D PROBLEM=blast.
+
+<comment>
+problem = 2D spherical blast wave, AMR
+reference = Gardiner & Stone 2005, JCP, 205, 509
+
+<job>
+basename = BlastAMR2D8LevLAT
+
+<mesh>
+nghost = 2
+nx1 = 128
+x1min = -0.5
+x1max = 0.5
+ix1_bc = outflow
+ox1_bc = outflow
+
+nx2 = 128
+x2min = -0.5
+x2max = 0.5
+ix2_bc = outflow
+ox2_bc = outflow
+
+nx3 = 1
+x3min = -0.5
+x3max = 0.5
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 32
+nx2 = 32
+nx3 = 1
+
+<mesh_refinement>
+refinement = adaptive
+num_levels = 8
+refinement_interval = 256
+max_nmb_per_rank = 8192
+
+<amr_criterion0>
+method = slope
+variable = hydro_w_d
+value_max = 0.1
+derefine_value_max = 0.02
+
+<refined_region0>
+level = 7
+x1min = -0.1
+x1max = 0.1
+x2min = -0.1
+x2max = 0.1
+x3min = -0.1
+x3max = 0.1
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.3
+nlim = -1
+tlim = 0.1
+ndiag = 50
+lat = true
+hydro_lat_levels = 7
+hydro_lat_same_level = true
+hydro_lat_same_level_max_ratio = 2
+hydro_lat_neighbor_limiter = all
+hydro_lat_diagnostics = false
+
+<hydro>
+eos = ideal
+reconstruct = plm
+rsolver = hllc
+gamma = 1.666666666667
+dfloor = 1.0e-12
+pfloor = 1.0e-12
+
+<problem>
+pn_amb = 0.1
+prat = 100.0
+inner_radius = 0.1
+outer_radius = 0.1
+
+<output1>
+file_type = hst
+dt = 0.01
+
+<output2>
+file_type = bin
+variable = hydro_w
+dt = 0.01

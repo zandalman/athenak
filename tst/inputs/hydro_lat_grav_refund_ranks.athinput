@@ -1,0 +1,112 @@
+# AthenaK regression input for the rank independence of the LAT window-end gravitational-work
+# refund.  The coupling weight of the gravity source is below one for every density of the
+# run (rho_grav_min = 1e3 against gas of density 1), so the refund owes only the admitted part
+# of every mismatch.  The receivers of the coarse/fine and same-level faces are slow blocks:
+# with ten ranks some ranks hold only slow blocks and have no active block on the ticks
+# between their steps, and the mass the faster neighbours move across the face on those ticks
+# has to be weighed there too.  A block's CFL step includes its ghost cells, so a vacuum block
+# next to the dense gas steps as fast as the gas does; the two vacuum blocks that are not
+# neighbours of the gas (x1 in [-0.75, -0.25]) are the slow ones, and each sits next to a
+# vacuum block of the fast bin, which makes the same-level pair of two factors.
+
+<comment>
+problem = dense gas venting across a coarse/fine face into vacuum, gravity weight below one
+
+<job>
+basename = HydroLATGravRefundRanks
+
+<mesh>
+nghost = 2
+nx1 = 64
+x1min = -1.0
+x1max = 1.0
+ix1_bc = periodic
+ox1_bc = periodic
+
+nx2 = 8
+x2min = -0.125
+x2max = 0.125
+ix2_bc = periodic
+ox2_bc = periodic
+
+nx3 = 8
+x3min = -0.125
+x3max = 0.125
+ix3_bc = periodic
+ox3_bc = periodic
+
+<meshblock>
+nx1 = 8
+nx2 = 8
+nx3 = 8
+
+<mesh_refinement>
+refinement = static
+
+<refined_region0>
+level = 1
+x1min = 0.0
+x1max = 0.25
+x2min = -0.125
+x2max = 0.125
+x3min = -0.125
+x3max = 0.125
+
+<time>
+evolution = dynamic
+integrator = rk2
+cfl_number = 0.3
+nlim = -1
+tlim = 0.02
+ndiag = 1000
+lat = true
+lat_levels = 3
+lat_same_level = true
+lat_same_level_max_ratio = 2
+lat_diagnostics = true
+hydro_lat_min_bin_count = 0
+
+<hydro>
+eos = ideal
+reconstruct = plm
+rsolver = hllc
+gamma = 1.4
+dfloor = 1.0e-16
+pfloor = 1.0e-18
+
+<hydro_srcterms>
+self_gravity = true
+
+<gravity>
+four_pi_G = 100.0
+threshold = 1.0e-8
+niteration = -1
+npresmooth = 2
+npostsmooth = 2
+full_multigrid = true
+fmg_ncycle = 1
+show_defect = false
+mg_nghost = 1
+root_on_host = false
+rho_grav_min = 1.0e3
+solve_dt = 0.01
+
+<problem>
+pgen_name = shock_tube
+shock_dir = 1
+xshock = 0.0
+dl = 1.0e-16
+pl = 1.0e-18
+ul = 0.0
+vl = 0.0
+wl = 0.0
+dr = 1.0
+pr = 1.0
+ur = 0.0
+vr = 0.0
+wr = 0.0
+
+<output1>
+file_type = hst
+dt = 1.0e-8
+data_format = %24.16e

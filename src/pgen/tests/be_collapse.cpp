@@ -53,6 +53,7 @@ Real m0, v0, t0, l0, rho0_phys, gauss_unit;
 
 // Runtime parameters stored for cooling source term
 Real rc_global;
+Real x_center_global, y_center_global, z_center_global;
 Real rhocrit_code;     // critical density in code units (0 = not used / isothermal)
 Real gamma_global;     // gamma for adiabatic EOS
 bool is_ideal_global;  // true if adiabatic EOS
@@ -111,6 +112,9 @@ void ProblemGenerator::BECollapse(ParameterInput *pin, const bool restart) {
   // --- barotropic cooling source term (adiabatic EOS only) ---
   Real rc = pin->GetOrAddReal("problem", "cloud_radius", rc_default);
   rc_global = rc;
+  x_center_global = pin->GetOrAddReal("problem", "x_center", 0.0);
+  y_center_global = pin->GetOrAddReal("problem", "y_center", 0.0);
+  z_center_global = pin->GetOrAddReal("problem", "z_center", 0.0);
 
   Real mass = pin->GetOrAddReal("problem", "mass", 0.0);
   Real temp = pin->GetOrAddReal("problem", "temperature", 0.0);
@@ -155,9 +159,9 @@ void ProblemGenerator::BECollapse(ParameterInput *pin, const bool restart) {
 
   // --- problem parameters ---
   Real amp = pin->GetOrAddReal("problem", "amp", 0.0);
-  Real x_center = pin->GetOrAddReal("problem", "x_center", 0.0);
-  Real y_center = pin->GetOrAddReal("problem", "y_center", 0.0);
-  Real z_center = pin->GetOrAddReal("problem", "z_center", 0.0);
+  Real x_center = x_center_global;
+  Real y_center = y_center_global;
+  Real z_center = z_center_global;
   Real rcsq = SQR(rc) * rcsq_fac;
 
   // Solid-body rotation: omega = omegatff / tff, where tff = pi*sqrt(3/(8f))
@@ -215,7 +219,7 @@ void ProblemGenerator::BECollapse(ParameterInput *pin, const bool restart) {
       Real rho = f * BEProfile(r_clamped, rcsq);
       if (amp > 0.0 && r < rc) {
         rho *= (1.0 + amp * SQR(r) / SQR(rc)
-                * Kokkos::cos(2.0 * Kokkos::atan2(y, x)));
+                * Kokkos::cos(2.0 * Kokkos::atan2(y - y_center, x - x_center)));
       }
 
       u0(m, IDN, k, j, i) = rho;
@@ -257,7 +261,7 @@ void ProblemGenerator::BECollapse(ParameterInput *pin, const bool restart) {
       Real rho = f * BEProfile(r_clamped, rcsq);
       if (amp > 0.0 && r < rc) {
         rho *= (1.0 + amp * SQR(r) / SQR(rc)
-                * Kokkos::cos(2.0 * Kokkos::atan2(y, x)));
+                * Kokkos::cos(2.0 * Kokkos::atan2(y - y_center, x - x_center)));
       }
 
       u0(m, IDN, k, j, i) = rho;
@@ -368,6 +372,9 @@ void BarotropicCooling(Mesh *pm, const Real bdt) {
   auto &size = pmbp->pmb->mb_size;
 
   Real rc = rc_global;
+  Real x_center = x_center_global;
+  Real y_center = y_center_global;
+  Real z_center = z_center_global;
   Real rhocrit = rhocrit_code;
   Real gm1 = gamma_global - 1.0;
   Real igm1 = 1.0 / gm1;
@@ -387,7 +394,7 @@ void BarotropicCooling(Mesh *pm, const Real bdt) {
       Real x = CellCenterX(i - is, indcs.nx1, x1min, x1max);
       Real y = CellCenterX(j - js, indcs.nx2, x2min, x2max);
       Real z = CellCenterX(k - ks, indcs.nx3, x3min, x3max);
-      Real r2 = SQR(x) + SQR(y) + SQR(z);
+      Real r2 = SQR(x - x_center) + SQR(y - y_center) + SQR(z - z_center);
 
       // Zero momentum outside the initial cloud
       if (r2 > SQR(rc)) {
@@ -421,7 +428,7 @@ void BarotropicCooling(Mesh *pm, const Real bdt) {
       Real x = CellCenterX(i - is, indcs.nx1, x1min, x1max);
       Real y = CellCenterX(j - js, indcs.nx2, x2min, x2max);
       Real z = CellCenterX(k - ks, indcs.nx3, x3min, x3max);
-      Real r2 = SQR(x) + SQR(y) + SQR(z);
+      Real r2 = SQR(x - x_center) + SQR(y - y_center) + SQR(z - z_center);
 
       if (r2 > SQR(rc)) {
         u0(m, IM1, k, j, i) = 0.0;

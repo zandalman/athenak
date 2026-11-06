@@ -30,7 +30,7 @@ namespace Primitive {
 
 template<typename LogPolicy>
 class EOSCompOSE : public EOSPolicyInterface, public LogPolicy, public SupportsEntropy,
-                   public SupportsChemicalPotentials {
+                   public SupportsChemicalPotentials, public SupportsGasEntropy {
  private:
   using LogPolicy::log2_;
   using LogPolicy::exp2_;
@@ -129,6 +129,23 @@ class EOSCompOSE : public EOSPolicyInterface, public LogPolicy, public SupportsE
   KOKKOS_INLINE_FUNCTION Real Entropy(Real n, Real T, Real *Y) const {
     assert (m_initialized);
     return eval_at_nty(ECENT, n, T, Y[0]);
+  }
+
+  /// The adiabat label of the GR entropy fallback: the tabulated entropy per baryon,
+  /// constant along an adiabat at fixed composition.
+  KOKKOS_INLINE_FUNCTION Real GasEntropy(Real n, Real T, Real *Y) const {
+    return Entropy(n, T, Y);
+  }
+
+  /// Its inverse at fixed (n, Yq): the table's entropy is linear in log T between the
+  /// T nodes, so temperature_from_var inverts the interpolant exactly; an entropy below
+  /// the table's at min_T returns min_T (the EOS lower bound).
+  KOKKOS_INLINE_FUNCTION Real TemperatureFromGasEntropy(Real n, Real s, Real *Y) const {
+    assert (m_initialized);
+    if (n < min_n) {
+      return min_T;
+    }
+    return temperature_from_var(ECENT, s, n, Y[0]);
   }
 
   /// Calculate the enthalpy per baryon using.
@@ -431,7 +448,7 @@ class EOSCompOSE : public EOSPolicyInterface, public LogPolicy, public SupportsE
       }
     }
 
-    if (flo*fhi>0.0 && (iv==ECLOGP || iv==ECLOGE)) {
+    if (flo*fhi>0.0 && (iv==ECLOGP || iv==ECLOGE || iv==ECENT)) {
       /*if (iv == ECLOGE) {
         Real vlo = eval_at_nty(iv,n,min_T,Yq);
         Real vhi = eval_at_nty(iv,n,max_T,Yq);

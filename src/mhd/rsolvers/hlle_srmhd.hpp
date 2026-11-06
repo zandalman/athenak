@@ -19,13 +19,13 @@ namespace mhd {
 template <int ivx>
 KOKKOS_INLINE_FUNCTION
 void HLLE_SR(const EOS_Data &eos,
-             const int m, const int k, const int j, const int i,
+             const int m, const int mb, const int k, const int j, const int i,
              const int is, const int js, const int ks,
              const DvceArray5D<Real> &wl, const DvceArray5D<Real> &wr,
              const DvceArray5D<Real> &bl, const DvceArray5D<Real> &br,
              const DvceArray4D<Real> &bx,
-             const DvceArray5D<Real> &flx,
-             const DvceArray4D<Real> &ey, const DvceArray4D<Real> &ez) {
+             const BandView5D<Real> &flx,
+             const BandView4D<Real> &ey, const BandView4D<Real> &ez) {
   constexpr int ivy = IVX + ((ivx-IVX) + 1)%3;
   constexpr int ivz = IVX + ((ivx-IVX) + 2)%3;
   constexpr int iby = ((ivx-IVX) + 1)%3;
@@ -35,34 +35,34 @@ void HLLE_SR(const EOS_Data &eos,
 
 
   // Extract left primitives
-  Real rho_l = wl(m,IDN,k,j,i);
-  Real ux_l = wl(m,ivx,k,j,i);
-  Real uy_l = wl(m,ivy,k,j,i);
-  Real uz_l = wl(m,ivz,k,j,i);
+  Real rho_l = wl(mb,IDN,k,j,i);
+  Real ux_l = wl(mb,ivx,k,j,i);
+  Real uy_l = wl(mb,ivy,k,j,i);
+  Real uz_l = wl(mb,ivz,k,j,i);
   Real u_l[4];
   u_l[0] = std::sqrt(1.0 + SQR(ux_l) + SQR(uy_l) + SQR(uz_l));
   u_l[1] = ux_l;
   u_l[2] = uy_l;
   u_l[3] = uz_l;
-  Real bb2_l = bl(m,iby,k,j,i);
-  Real bb3_l = bl(m,ibz,k,j,i);
+  Real bb2_l = bl(mb,iby,k,j,i);
+  Real bb3_l = bl(mb,ibz,k,j,i);
 
   // Extract right primitives
-  Real rho_r = wr(m,IDN,k,j,i);
-  Real ux_r = wr(m,ivx,k,j,i);
-  Real uy_r = wr(m,ivy,k,j,i);
-  Real uz_r = wr(m,ivz,k,j,i);
+  Real rho_r = wr(mb,IDN,k,j,i);
+  Real ux_r = wr(mb,ivx,k,j,i);
+  Real uy_r = wr(mb,ivy,k,j,i);
+  Real uz_r = wr(mb,ivz,k,j,i);
   Real u_r[4];
   u_r[0] = std::sqrt(1.0 + SQR(ux_r) + SQR(uy_r) + SQR(uz_r));
   u_r[1] = ux_r;
   u_r[2] = uy_r;
   u_r[3] = uz_r;
-  Real bb2_r = br(m,iby,k,j,i);
-  Real bb3_r = br(m,ibz,k,j,i);
+  Real bb2_r = br(mb,iby,k,j,i);
+  Real bb3_r = br(mb,ibz,k,j,i);
 
   Real pgas_l, pgas_r;
-  pgas_l = eos.IdealGasPressure(wl(m,IEN,k,j,i));
-  pgas_r = eos.IdealGasPressure(wr(m,IEN,k,j,i));
+  pgas_l = eos.IdealGasPressure(wl(mb,IEN,k,j,i));
+  pgas_r = eos.IdealGasPressure(wr(mb,IEN,k,j,i));
 
   // Extract normal magnetic field
   Real bb1 = bx(m,k,j,i);

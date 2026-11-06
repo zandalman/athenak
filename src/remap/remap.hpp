@@ -1,0 +1,240 @@
+#ifndef REMAP_REMAP_HPP_
+#define REMAP_REMAP_HPP_
+//========================================================================================
+// AthenaK astrophysical plasma code
+// Copyright(C) 2020 James M. Stone <jmstone@ias.edu> and the Athena code team
+// Licensed under the 3-clause BSD License (the "LICENSE")
+//========================================================================================
+//! \file remap.hpp
+//! \brief Universal restart-remap module.
+//!
+//! Loads an AthenaK restart file written by a DIFFERENT mesh configuration and resamples
+//! its state onto the current mesh: cell-centered conserved variables (hydro or MHD,
+//! optionally radiation i0) through the AMR-hierarchy
+//! sampling engine originally developed in the tde_external pgen, and the face-centered
+//! magnetic field through an exactly divergence-free vector-potential path (source B ->
+//! exact discrete inverse curl on the source root covering grid -> C1 Catmull-Rom
+//! interpolation of A -> discrete curl on the target mesh).  See
+//! docs/design/remap_module_design.md for the full design.
+//!
+//! Relativity classes (remap_impl.hpp RemapRelClass) gate the behavior: Newtonian sources
+//! keep the original floor-fade CC engine bit-for-bit, while fixed-GR and dyn-GR (<adm>,
+//! analytic metric) sources use the keep-target CC engine, remap the GR conserved
+//! variables verbatim (no magnetic-energy swap), and refresh the analytic metric at the
+//! source time.  z4c sources and targets are refused.
+//!
+//! The module runs host-side at ProblemGenerator time or from a pgen after_cycle hook.
+//! Mid-run callers must call Driver::InitBoundaryValuesAndPrimitives afterwards.
+
+#include <functional>
+#include <string>
+
+#include "athena.hpp"
+
+class Driver;
+class Mesh;
+class MeshBlockPack;
+class Outputs;
+class ParameterInput;
+class ProblemGenerator;
+
+namespace remap {
+
+//----------------------------------------------------------------------------------------
+//! \enum RemapBandMode
+//! \brief what the CC engine does inside (and outside) the old-domain boundary band.
+//!
+//! kFloorFade  — the historical Newtonian behavior: every target cell is overwritten, the
+//!               band is reconstructed from the interior profile and tapered toward the
+//!               ambient hydro floor, and cells outside the old box become floor state.
+//! kKeepTarget — the target's own ProblemGenerator state is the ambient: cells with no
+//!               source support are left untouched, band cells are a linear blend of the
+//!               (plainly interpolated) source conserved state and the pgen state, and
+//!               only fully covered cells are overwritten.  No Newtonian thermodynamics
+//!               is applied anywhere, which is what makes it the only valid mode in GR.
+
+enum class RemapBandMode { kFloorFade, kKeepTarget };
+
+//----------------------------------------------------------------------------------------
+//! \struct RemapOptions
+//! \brief caller-provided behavior knobs and hooks
+
+struct RemapOptions {
+  std::string source_path;                  // path of the source restart file
+
+  // CC behavior (defaults preserve the historical tde_external behavior exactly)
+  bool use_transition_band = true;          // old-domain boundary reconstruction band
+  RemapBandMode band_mode = RemapBandMode::kFloorFade;  // band semantics (see above)
+  // band_mode_auto: resolve band_mode from the relativity class of the remap (GR ->
+  // kKeepTarget, Newtonian -> kFloorFade) once the source has been classified.  Set
+  // false by an explicit <remap>/band_mode = floor|keep, which is then honored verbatim.
+  bool band_mode_auto = true;
+  // cells for which skip_cell returns true keep the ambient state (e.g. excision): the
+  // ambient floor under kFloorFade, the untouched pgen state under kKeepTarget
+  std::function<bool(Real x, Real y, Real z)> skip_cell;
+
+  // FC (MHD) behavior
+  bool b_coarsen_ok = false;                // allow multi-level MHD source (B restricted
+                                            // to the source root grid; CC keeps detail)
+  int b_taper_root_cells = 4;               // smoothstep taper width (source root cells)
+                                            // applied to A outside the source box
+  bool b_report = true;                     // print inverse-curl consistency diagnostics
+
+  // optional CC groups
+  bool remap_radiation_i0 = true;           // remap radiation i0 intensities if both
+                                            // sides carry the module (GR only)
+
+  // LAT (<time>/lat).  A remap replaces the state of every block at once, so it may only
+  // run while no LAT window is in progress.  The startup remap (MaybeAutoRemap) sets
+  // this: no window exists yet.  A mid-run caller instead pauses LAT first
+  // (Mesh::hydro_lat_suspended, set at a synchronized point), which has the same effect.
+  // With neither, a remap under time/lat = true is fatal.
+  bool lat_idle = false;
+};
+
+//----------------------------------------------------------------------------------------
+//! \struct RemapSummary
+//! \brief what the remap actually did; returned by LoadAndApplyRemap and passed to the
+//! ProblemGenerator user_remap_post_func hook so pgens can react.
+
+struct RemapSummary {
+  Real time = 0.0;              // source time installed into the mesh
+  int ncycle = 0;
+  bool fc_applied = false;      // face-centered B was remapped
+  bool gr_mode = false;         // relativity class was kFixedGR or kDynGRAnalytic
+  bool i0_applied = false;      // radiation (i0 intensities) was remapped
+};
+
+//----------------------------------------------------------------------------------------
+//! \fn LoadAndApplyRemap
+//! \brief Load the source restart and remap its state onto pmbp.
+//!
+//! Sets pm->time/dt/ncycle from the source, optionally copies <outputN>
+//! file_number/last_time into dst_pin, and invokes on_loaded(source_pin) after the source
+//! parameter dump is available (before the state is applied) so the pgen can restore its
+//! own metadata (e.g. the TDE BH/frame record).  Fatal (clean exit) on any unsupported
+//! source physics; see docs/design/remap_module_design.md section 0 for the exclusion
+//! list.
+
+RemapSummary LoadAndApplyRemap(Mesh *pm, MeshBlockPack *pmbp, ParameterInput *dst_pin,
+                               bool copy_output_state, const char *banner_label,
+                               const RemapOptions &opts,
+                               const std::function<void(ParameterInput *)> &on_loaded
+                                   = nullptr);
+
+//----------------------------------------------------------------------------------------
+// <remap>-block auto mode: a pgen-independent activation path, wired like a module-level
+// block (<gravity>-style).  If the input carries a <remap> block with enable = true
+// (default true when the block exists — keep an explicit enable key in production inputs
+// so it can be toggled from the command line), the ProblemGenerator fresh-start
+// constructor calls MaybeAutoRemap right after the pgen function returns.  Any pgen can
+// therefore be remapped with ZERO pgen code; pgens with special needs enroll the
+// ProblemGenerator hook members user_remap_skip_func / user_remap_loaded_func /
+// user_remap_post_func inside their pgen function.
+//
+// <remap> block keys (all optional except source):
+//   enable            = true      master switch (block presence defaults it to true)
+//   source            = <path>    source restart file (required when enabled)
+//   copy_output_state = true      carry <outputN> file_number/last_time forward
+//   transition_band   = true      old-domain boundary reconstruction band (CC)
+//   band_mode         = auto      band semantics: auto | floor | keep.  auto selects
+//                                 "keep" for GR sources and "floor" for Newtonian ones;
+//                                 "floor" on a GR remap is a fatal error (its ambient
+//                                 thermodynamics is Newtonian by construction)
+//   b_coarsen_ok      = false     accept multi-level MHD sources (B -> root grid)
+//   b_taper_root_cells= 4         A-taper width outside the source box (root cells)
+//   b_report          = true      print FC diagnostics
+//   radiation_i0      = true      remap radiation i0 when both sides carry it
+//   settle_steps      = 0         plain steps to run after the startup remap before the
+//                                 remap is applied again (a "settle pass"); 0 = none.
+//                                 A pgen may seed a different default by reading the key
+//                                 with GetOrAdd before MaybeAutoRemap runs
+//                                 (tde_external seeds 20)
+//   settle_passes     = 1         number of settle passes (each preceded by settle_steps)
+//   inherit_tree      = false     build the target tree from the source's (see below)
+//   auto_expand       = false     grow the domain when needed gas nears a face (below)
+//   expand_coarsen    = false     every expansion also doubles the root cell
+//   expand_max_x1min ... expand_max_x3max
+//                                 outer limits of the grown domain (auto_expand only)
+//
+// Settle steps (any pgen).  The first remap lays the source state onto the target mesh as
+// it was built at t = 0; the mesh then adapts to that state, so the state is remapped a
+// second time onto the adapted mesh.  While a settle is pending: AMR checks every cycle
+// (the configured cadence returns after the last pass), outputs are suppressed, and, with
+// time/lat = true, LAT is paused (Mesh::hydro_lat_suspended), so the settle steps and the
+// passes are plain steps of the global time step.  The Driver calls AfterCycleSettle at
+// every synchronized point.  Each pass calls the pgen's user_remap_loaded_func and
+// user_remap_post_func like the startup remap, then call
+// Driver::InitBoundaryValuesAndPrimitives.
+
+bool IsAutoRemapEnabled(ParameterInput *pin);
+RemapOptions OptionsFromInput(ParameterInput *pin);
+void MaybeAutoRemap(ProblemGenerator *pgen, ParameterInput *pin, Mesh *pm);
+
+// True while settle steps are pending: outputs are suppressed (Driver checks this).
+bool SettleActive();
+// Called by the Driver at every synchronized point.  Runs the next settle pass once the
+// settle steps have elapsed.  Returns true if the state was replaced.
+bool AfterCycleSettle(Driver *driver, ParameterInput *pin, Mesh *pm);
+
+//----------------------------------------------------------------------------------------
+// Tree inheritance and automatic domain expansion (remap_expand.cpp).
+//
+// <remap>/inherit_tree = true (fresh start from a <remap> source): the target MeshBlock
+// tree is the source's own tree placed on a root grid that contains the source domain,
+// whose root cells are 2^k times the source's (k >= 0, the same on every axis), whose
+// MeshBlocks have the source's size and whose origin is offset from the source's by whole
+// source root MeshBlocks.  A source block of physical level p becomes a target block of
+// physical level p + k, the same cells; a block that would exceed the target's
+// <mesh_refinement>/num_levels is merged into its ancestor at the deepest target level.
+// With AMR, a tree that would hold more than 0.9 of the MeshBlock budget
+// <mesh_refinement>/max_nmb_total (counted with the 2:1 neighbours
+// MeshBlockTree::Refine adds) loses its deepest levels the same way, one level at a time,
+// until it fits.  The CC engine then copies every coincident cell
+// (TargetCellMatchesSourceGrid) and samples every merged cell like any remapped cell: two
+// trilinear sub-samples per axis, which are the mean of the 2^3 children one level down
+// and of the 4^3 grandchildren two levels down, so no settle pass is needed.
+// Mesh::BuildTreeFromScratch calls AddSourceTreeLeaves.
+//
+// <remap>/auto_expand = true: the Driver calls AfterCycleExpand at every synchronized end
+// of an outer step (also after a plain restart).  The pgen reports through
+// ProblemGenerator::user_expand_need_func whether gas it needs lies within
+// kExpandBufferRootCells root cells of a face and, on a full scan in a frame where it can
+// predict it (have_box), the box that gas reaches.  The first call and every call that
+// finds such gas plan an expansion.  With a predicted box every face moves out to cover
+// it plus the buffer of the grown root cell; without one, each face with needed gas at
+// it moves out by the current length of its axis.  Faces move by whole root
+// MeshBlocks; with <remap>/expand_coarsen = true every expansion also doubles the root
+// cell (the levels keep their number, so the finest cell doubles too).  Never past
+// <remap>/expand_max_x1min ... expand_max_x3max (all six required); the MeshBlock budget
+// stops an expansion only when the grown root grid alone exceeds 0.9 of it, since the
+// inherited tree is coarsened to fit (above).  A planned expansion
+// ends the pass at that point: Finalize writes the checkpoint and ApplyExpansion puts the
+// grown mesh and a <remap> block into the input, which inherits the tree from that
+// checkpoint, with transition_band = false and settle_steps = 0.  main then builds the next Mesh, Driver and
+// Outputs from that input in the same process, as a fresh start that remaps the
+// checkpoint.  A face that has to move but is held by a limit or the budget is reported
+// once and left to its boundary condition.
+
+constexpr int kExpandBufferRootCells = 4;
+
+// Faces in BoundaryFace order: x1min, x1max, x2min, x2max, x3min, x3max.
+struct ExpandNeed {
+  bool near_face[6] = {false, false, false, false, false, false};
+  bool have_box = false;              // full scan predicted the box below
+  Real box_min[3] = {0.0, 0.0, 0.0};  // extent the needed gas reaches
+  Real box_max[3] = {0.0, 0.0, 0.0};
+  Real center[3] = {0.0, 0.0, 0.0};   // origin of the radiation exterior extrapolation
+};
+// (pm, buffer width per axis, full scan?, result)
+using ExpandNeedFn = std::function<void(Mesh *, const Real *, bool, ExpandNeed &)>;
+
+bool InheritTreeRequested(ParameterInput *pin);
+void AddSourceTreeLeaves(Mesh *pm, ParameterInput *pin);
+bool AfterCycleExpand(Driver *driver, ParameterInput *pin, Mesh *pm);
+bool ExpandRequested();
+bool ApplyExpansion(Mesh *pm, ParameterInput *pin, Outputs *pout);
+
+}  // namespace remap
+
+#endif  // REMAP_REMAP_HPP_

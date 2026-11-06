@@ -12,70 +12,57 @@
 #include "athena.hpp"
 #include "mesh/mesh.hpp"
 
+namespace {
 void BCHelperMHD(MeshBlockPack *ppack, DualArray2D<Real> b_in, DvceFaceFld4D<Real> b0,
                  int is, int ie, int js, int je, int ks, int ke, int n1, int n2, int n3);
+}  // namespace
 
 //----------------------------------------------------------------------------------------
 //! \fn void BoundaryValues::BFieldBCs()
-//! \brief Apply physical boundary conditions for all MHD variables on the fine array at
-//  faces of the MB which are at the edge of the computational domain. This is applied
-//  *after* prolongation (see MHD::Prolongate / MHD::ApplyPhysicalBCs), so that the
-//  corner ghost zones between a coarse neighbor and a physical boundary -- which are
-//  filled by extrapolation from the coarse/fine interface ghosts -- read valid data.
+//! \brief Apply physical boundary conditions to the fine face field after prolongation.
+
 void MeshBoundaryValues::BFieldBCs(MeshBlockPack *ppack, DualArray2D<Real> b_in,
                                DvceFaceFld4D<Real> b0) {
   auto &indcs = ppack->pmesh->mb_indcs;
   int &ng = indcs.ng;
-
   int n1 = indcs.nx1 + 2*ng;
   int n2 = (indcs.nx2 > 1)? (indcs.nx2 + 2*ng) : 1;
   int n3 = (indcs.nx3 > 1)? (indcs.nx3 + 2*ng) : 1;
-  int is = indcs.is;
-  int ie = indcs.ie;
-  int js = indcs.js;
-  int je = indcs.je;
-  int ks = indcs.ks;
-  int ke = indcs.ke;
-
-  BCHelperMHD(ppack, b_in, b0, is, ie, js, je, ks, ke, n1, n2, n3);
+  BCHelperMHD(ppack, b_in, b0, indcs.is, indcs.ie, indcs.js, indcs.je,
+              indcs.ks, indcs.ke, n1, n2, n3);
 }
 
 //----------------------------------------------------------------------------------------
 //! \fn void BoundaryValues::BFieldBCsCoarse()
-//! \brief Apply physical boundary conditions for all MHD variables on the coarse array.
-//  This must be done *before* prolongation so that the prolongation stencil has valid
-//  data in the coarse ghost zones that sit at a physical boundary.
+//! \brief Fill coarse physical-boundary ghosts before face-field prolongation.
+
 void MeshBoundaryValues::BFieldBCsCoarse(MeshBlockPack *ppack, DualArray2D<Real> b_in,
-                               DvceFaceFld4D<Real> coarse_b0) {
+                                         DvceFaceFld4D<Real> coarse_b0) {
   auto &indcs = ppack->pmesh->mb_indcs;
   int &ng = indcs.ng;
-
-  int cn1 = indcs.cnx1 + 2*ng;
-  int cn2 = (indcs.cnx2 > 1)? (indcs.cnx2 + 2*ng) : 1;
-  int cn3 = (indcs.cnx3 > 1)? (indcs.cnx3 + 2*ng) : 1;
-  int cis = indcs.cis;
-  int cie = indcs.cie;
-  int cjs = indcs.cjs;
-  int cje = indcs.cje;
-  int cks = indcs.cks;
-  int cke = indcs.cke;
-
-  BCHelperMHD(ppack, b_in, coarse_b0, cis, cie, cjs, cje, cks, cke, cn1, cn2, cn3);
+  int n1 = indcs.cnx1 + 2*ng;
+  int n2 = (indcs.cnx2 > 1)? (indcs.cnx2 + 2*ng) : 1;
+  int n3 = (indcs.cnx3 > 1)? (indcs.cnx3 + 2*ng) : 1;
+  BCHelperMHD(ppack, b_in, coarse_b0, indcs.cis, indcs.cie, indcs.cjs,
+              indcs.cje, indcs.cks, indcs.cke, n1, n2, n3);
 }
 
+namespace {
 void BCHelperMHD(MeshBlockPack *ppack, DualArray2D<Real> b_in, DvceFaceFld4D<Real> b0,
                  int is, int ie, int js, int je, int ks, int ke, int n1, int n2, int n3) {
-  // loop over all MeshBlocks in this MeshBlockPack
   auto &pm = ppack->pmesh;
   int &ng = ppack->pmesh->mb_indcs.ng;
   auto &mb_bcs = ppack->pmb->mb_bcs;
-
   int nmb = ppack->nmb_thispack;
+  const int nwork = nmb;
+  if (nwork <= 0) return;
 
-  // only apply BCs if not periodic
-  if (pm->mesh_bcs[BoundaryFace::inner_x1] != BoundaryFlag::periodic) {
-    par_for("bfield-bc_x1", DevExeSpace(), 0,(nmb-1),0,(n3-1),0,(n2-1),
-    KOKKOS_LAMBDA(int m, int k, int j) {
+  // only apply BCs where a face has a generic physical boundary condition
+  if (HasGenericPhysicalBC(pm->mesh_bcs[BoundaryFace::inner_x1]) ||
+      HasGenericPhysicalBC(pm->mesh_bcs[BoundaryFace::outer_x1])) {
+    par_for("bfield-bc_x1", DevExeSpace(), 0,(nwork-1),0,(n3-1),0,(n2-1),
+    KOKKOS_LAMBDA(int a, int k, int j) {
+      const int m = a;
       // apply physical boundaries to inner_x1
       switch (mb_bcs.d_view(m,BoundaryFace::inner_x1)) {
         case BoundaryFlag::reflect:
@@ -87,6 +74,7 @@ void BCHelperMHD(MeshBlockPack *ppack, DualArray2D<Real> b_in, DvceFaceFld4D<Rea
             if (k == n3-1) {b0.x3f(m,k+1,j,is-i-1) = b0.x3f(m,k+1,j,is+i);}
           }
           break;
+        case BoundaryFlag::outflow_only:  // non-hydro fields: as outflow
         case BoundaryFlag::outflow:
         case BoundaryFlag::diode:
         case BoundaryFlag::vacuum:
@@ -126,6 +114,7 @@ void BCHelperMHD(MeshBlockPack *ppack, DualArray2D<Real> b_in, DvceFaceFld4D<Rea
             if (k == n3-1) {b0.x3f(m,k+1,j,ie+i+1) = b0.x3f(m,k+1,j,ie-i);}
           }
           break;
+        case BoundaryFlag::outflow_only:  // non-hydro fields: as outflow
         case BoundaryFlag::outflow:
         case BoundaryFlag::diode:
         case BoundaryFlag::vacuum:
@@ -157,10 +146,12 @@ void BCHelperMHD(MeshBlockPack *ppack, DualArray2D<Real> b_in, DvceFaceFld4D<Rea
   }
   if (pm->one_d) return;
 
-  // only apply BCs if not periodic
-  if (pm->mesh_bcs[BoundaryFace::inner_x2] != BoundaryFlag::periodic) {
-    par_for("bfield-bc_x2", DevExeSpace(), 0,(nmb-1),0,(n3-1),0,(n1-1),
-    KOKKOS_LAMBDA(int m, int k, int i) {
+  // only apply BCs where a face has a generic physical boundary condition
+  if (HasGenericPhysicalBC(pm->mesh_bcs[BoundaryFace::inner_x2]) ||
+      HasGenericPhysicalBC(pm->mesh_bcs[BoundaryFace::outer_x2])) {
+    par_for("bfield-bc_x2", DevExeSpace(), 0,(nwork-1),0,(n3-1),0,(n1-1),
+    KOKKOS_LAMBDA(int a, int k, int i) {
+      const int m = a;
       // apply physical boundaries to inner_x2
       switch (mb_bcs.d_view(m,BoundaryFace::inner_x2)) {
         case BoundaryFlag::reflect:
@@ -172,6 +163,7 @@ void BCHelperMHD(MeshBlockPack *ppack, DualArray2D<Real> b_in, DvceFaceFld4D<Rea
             if (k == n3-1) {b0.x3f(m,k+1,js-j-1,i) = b0.x3f(m,k+1,js+j,i);}
           }
           break;
+        case BoundaryFlag::outflow_only:  // non-hydro fields: as outflow
         case BoundaryFlag::outflow:
         case BoundaryFlag::diode:
         case BoundaryFlag::vacuum:
@@ -211,6 +203,7 @@ void BCHelperMHD(MeshBlockPack *ppack, DualArray2D<Real> b_in, DvceFaceFld4D<Rea
             if (k == n3-1) {b0.x3f(m,k+1,je+j+1,i) = b0.x3f(m,k+1,je-j,i);}
           }
           break;
+        case BoundaryFlag::outflow_only:  // non-hydro fields: as outflow
         case BoundaryFlag::outflow:
         case BoundaryFlag::diode:
         case BoundaryFlag::vacuum:
@@ -242,10 +235,12 @@ void BCHelperMHD(MeshBlockPack *ppack, DualArray2D<Real> b_in, DvceFaceFld4D<Rea
   }
   if (pm->two_d) return;
 
-  // only apply BCs if not periodic
-  if (pm->mesh_bcs[BoundaryFace::inner_x3] == BoundaryFlag::periodic) return;
-  par_for("bfield-bc_x3", DevExeSpace(), 0,(nmb-1),0,(n2-1),0,(n1-1),
-  KOKKOS_LAMBDA(int m, int j, int i) {
+  // only apply BCs where a face has a generic physical boundary condition
+  if (!HasGenericPhysicalBC(pm->mesh_bcs[BoundaryFace::inner_x3]) &&
+      !HasGenericPhysicalBC(pm->mesh_bcs[BoundaryFace::outer_x3])) return;
+  par_for("bfield-bc_x3", DevExeSpace(), 0,(nwork-1),0,(n2-1),0,(n1-1),
+  KOKKOS_LAMBDA(int a, int j, int i) {
+    const int m = a;
     // apply physical boundaries to inner_x3
     switch (mb_bcs.d_view(m,BoundaryFace::inner_x3)) {
       case BoundaryFlag::reflect:
@@ -257,6 +252,7 @@ void BCHelperMHD(MeshBlockPack *ppack, DualArray2D<Real> b_in, DvceFaceFld4D<Rea
           b0.x3f(m,ks-k-1,j,i) = -b0.x3f(m,ks+k+1,j,i);
         }
         break;
+      case BoundaryFlag::outflow_only:  // non-hydro fields: as outflow
       case BoundaryFlag::outflow:
       case BoundaryFlag::diode:
       case BoundaryFlag::vacuum:
@@ -296,6 +292,7 @@ void BCHelperMHD(MeshBlockPack *ppack, DualArray2D<Real> b_in, DvceFaceFld4D<Rea
           b0.x3f(m,ke+k+2,j,i) = -b0.x3f(m,ke-k,j,i);
         }
         break;
+      case BoundaryFlag::outflow_only:  // non-hydro fields: as outflow
       case BoundaryFlag::outflow:
       case BoundaryFlag::diode:
       case BoundaryFlag::vacuum:
@@ -324,4 +321,7 @@ void BCHelperMHD(MeshBlockPack *ppack, DualArray2D<Real> b_in, DvceFaceFld4D<Rea
         break;
     }
   });
+
+  return;
 }
+}  // namespace

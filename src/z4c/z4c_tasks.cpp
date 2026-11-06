@@ -19,7 +19,6 @@
 #include "mesh/mesh.hpp"
 #include "bvals/bvals.hpp"
 #include "z4c/compact_object_tracker.hpp"
-#include "z4c/driftcontrol/driftcontrol.hpp"
 #include "z4c/fastflow.hpp"
 #include "z4c/horizon_dump.hpp"
 #include "z4c/z4c.hpp"
@@ -273,18 +272,10 @@ TaskStatus Z4c::RestrictU(Driver *pdrive, int stage) {
 
 TaskStatus Z4c::Prolongate(Driver *pdrive, int stage) {
   if (pmy_pack->pmesh->multilevel) {  // only prolongate with SMR/AMR
-    // Step 1: apply physical BCs to the coarse array, so the prolongation stencil
-    //         reads valid data in coarse ghost zones that sit at a physical boundary.
+//    pbval_u->FillCoarseInBndryCC(u0, coarse_u0, true);
     if (!(pmy_pack->pmesh->strictly_periodic)) {
       pbval_u->Z4cBCsCoarse(pmy_pack, pbval_u->u_in, coarse_u0);
     }
-
-    // Note: FillCoarseInBndryCC is intentionally not called here. For Z4c the
-    // coarse-array data in same-level boundary regions (including edges and
-    // corners) is communicated directly via the isame_z4c buffers in
-    // Send/RecvU, so restricting it again would be redundant.
-
-    // Step 2: prolongate fine ghost zones from the coarse array.
     pbval_u->ProlongateCC(u0, coarse_u0, true);
   }
   return TaskStatus::complete;
@@ -297,14 +288,12 @@ TaskStatus Z4c::Prolongate(Driver *pdrive, int stage) {
 TaskStatus Z4c::ApplyPhysicalBCs(Driver *pdrive, int stage) {
   // only apply BCs if domain is not strictly periodic
   if (!(pmy_pack->pmesh->strictly_periodic)) {
-    // Step 3: apply physical BCs to the fine array. This is called *after* prolongation,
-    //         so that the corner ghost zones between a coarse neighbor and a physical
-    //         boundary read valid data.
+    // physical BCs
     pbval_u->Z4cBCs((pmy_pack), (pbval_u->u_in), u0);
 
     // user BCs
     if (pmy_pack->pmesh->pgen->user_bcs) {
-      (pmy_pack->pmesh->pgen->user_bcs_func)(pmy_pack->pmesh);
+      pmy_pack->pmesh->pgen->CallUserBoundaryFunction(pmy_pack->pmesh);
     }
   }
   return TaskStatus::complete;
@@ -316,10 +305,6 @@ TaskStatus Z4c::TrackCompactObjects(Driver *pdrive, int stage) {
       pt->InterpolateVelocity(pmy_pack);
       pt->EvolveTracker(pmy_pack);
       pt->WriteTracker();
-    }
-    if (pmy_pack->pz4c->opt.enable_driftcontrol) {
-      pdrift_control->EvolveDriftControl();
-      pdrift_control->WriteDriftControl();
     }
   }
   return TaskStatus::complete;

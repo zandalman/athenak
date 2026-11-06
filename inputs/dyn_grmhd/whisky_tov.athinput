@@ -34,7 +34,7 @@ nx3  = 64        # Number of cells in each MeshBlock, X3-dir
 <time>
 evolution  = dynamic    # dynamic/kinematic/static
 integrator = rk3        # time integration algorithm
-cfl_number = 0.4
+cfl_number = 0.33
 nlim       = -1
 tlim       = 10000
 ndiag      = 1          # cycles between diagnostic output

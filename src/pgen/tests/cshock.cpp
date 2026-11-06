@@ -271,7 +271,7 @@ void ProblemGenerator::CShock(ParameterInput *pin, const bool restart) {
 
   // compute solution in u0 register when computing initial conditions
   // compute solution in u1 register when computing errors
-  auto &u0_hyd = (set_initial_conditions)? pmbp->phydro->u0 : pmbp->phydro->u1;
+  auto &u0_hyd = (set_initial_conditions)? pmbp->phydro->u0 : pmbp->phydro->u1.data;
   auto &u0_mhd = (set_initial_conditions)? pmbp->pmhd->u0 : pmbp->pmhd->u1;
   auto &b0 = (set_initial_conditions)? pmbp->pmhd->b0 : pmbp->pmhd->b1;
 
@@ -382,6 +382,8 @@ void ProblemGenerator::CShock(ParameterInput *pin, const bool restart) {
 void CShockErrors(ParameterInput *pin, Mesh *pm) {
   // calculate reference solution by calling pgen again.  Solution stored in second
   // register u1/b1 when flag is false.
+  // The reference goes into u1 over the whole block (Hydro and MHD::ExpandStartRegister).
+  if (pm->pmb_pack->phydro != nullptr) pm->pmb_pack->phydro->ExpandStartRegister();
   set_initial_conditions = false;
   pm->pgen->CShock(pin, false);
   pm->pgen->OutputErrors(pin, pm);

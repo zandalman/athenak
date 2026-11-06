@@ -1,0 +1,117 @@
+<comment>
+problem = remap battery: fixed-metric GR (kFixedGR) remap target on a DIFFERENT mesh.
+Same cell size as inputs/remap/grt_source.athinput but a wider domain (64^3 over
+[-64,64]^3 vs 48^3 over [-48,48]^3) and a different static refinement region, so the
+target extends beyond the source box and the band logic runs: with band_mode=auto in a
+GR class this is the "keep" path (cells with no source coverage keep the pgen state
+instead of fading toward the Newtonian floor).
+
+Gates (GT_regrid): div(B) at t0 and after 5 cycles + finiteness only.
+
+<job>
+basename = GRTRegrid
+
+<mesh>
+nghost = 4
+nx1    = 64
+x1min  = -64.0
+x1max  = 64.0
+ix1_bc = user
+ox1_bc = user
+
+nx2    = 64
+x2min  = -64.0
+x2max  = 64.0
+ix2_bc = user
+ox2_bc = user
+
+nx3    = 64
+x3min  = -64.0
+x3max  = 64.0
+ix3_bc = user
+ox3_bc = user
+
+<meshblock>
+nx1 = 16
+nx2 = 16
+nx3 = 16
+
+<mesh_refinement>
+refinement = static
+num_levels = 2
+
+<refined_region0>
+# 64^3 cells in 16^3 blocks = 4 root blocks per dimension ([-64,-32], [-32,0], [0,32],
+# [32,64]); level-1 slots span 16 units.  The region below selects slot 3 per dimension,
+# which the build_tree.cpp even/odd rounding widens to slots 2..3 = the root block
+# [-32,0]^3.  Deliberately NOT the source's refined region (the central root block).
+level = 1
+x1min = -12.0
+x1max = 0.0
+x2min = -12.0
+x2max = 0.0
+x3min = -12.0
+x3max = 0.0
+
+<time>
+evolution  = dynamic
+integrator = rk2
+cfl_number = 0.3
+# nlim is ABSOLUTE across a remap: remap.cpp adopts the SOURCE's ncycle, so this
+# is <grt_source.athinput ncycle = 30> + 5 = 35 post-remap cycles.
+nlim       = 35
+tlim       = 100000.0
+ndiag      = 1
+
+<coord>
+general_rel = true
+a           = 0.9375
+excise      = true
+dexcise     = 1.0e-10
+pexcise     = 0.333e-12
+
+<mhd>
+eos         = ideal
+reconstruct = ppm4
+rsolver     = hlle
+dfloor      = 1.0e-10
+pfloor      = 0.333e-12
+gamma       = 1.3333333333333333
+fofc        = true
+gamma_max   = 20.0
+
+<remap>
+enable          = true
+source          = replace_me.rst
+band_mode       = auto        # -> keep for GR classes
+transition_band = true
+b_coarsen_ok    = true        # source carries one static refinement level
+b_report        = true
+copy_output_state = false
+
+<problem>
+fm_torus   = true
+r_edge     = 6.0
+r_peak     = 12.0
+tilt_angle = 0.0
+potential_beta_min = 100.0
+potential_cutoff   = 0.2
+potential_rho_pow  = 1.0
+rho_min   = 1.0e-5
+rho_pow   = -1.5
+pgas_min  = 0.333e-7
+pgas_pow  = -2.5
+rho_max   = 1.0
+l         = 0.0
+pert_amp  = 0.0
+user_hist = false
+
+<output1>
+file_type = bin
+variable  = mhd_divb
+dt        = 100000.0
+
+<output2>
+file_type = bin
+variable  = mhd_w_bcc
+dt        = 100000.0

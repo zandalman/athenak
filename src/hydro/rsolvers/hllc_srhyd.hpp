@@ -25,11 +25,11 @@ namespace hydro {
 template <int ivx>
 KOKKOS_INLINE_FUNCTION
 void HLLC_SR(const EOS_Data &eos,
-             const int m, const int k, const int j, const int i,
+             const int m, const int mb, const int k, const int j, const int i,
              const int is, const int js, const int ks,
              const DvceArray5D<Real> &wl,
              const DvceArray5D<Real> &wr,
-             const DvceArray5D<Real> &flx) {
+             const BandView5D<Real> &flx) {
   constexpr int ivy = IVX + ((ivx-IVX)+1)%3;
   constexpr int ivz = IVX + ((ivx-IVX)+2)%3;
   const Real gamma_prime = eos.gamma/(eos.gamma - 1.0);
@@ -38,10 +38,10 @@ void HLLC_SR(const EOS_Data &eos,
   // Extract left primitives. Recall in SR the primitive variables are (\rho, u^i, P_gas),
   // where \rho is the mass density in the comoving/fluid frame, u^i = \gamma v^i are the
   // spatial components of the 4-velocity (v^i is the 3-velocity), and P_gas is pressure.
-  Real rho_l = wl(m,IDN,k,j,i);
-  Real ux_l  = wl(m,ivx,k,j,i);
-  Real uy_l  = wl(m,ivy,k,j,i);
-  Real uz_l  = wl(m,ivz,k,j,i);
+  Real rho_l = wl(mb,IDN,k,j,i);
+  Real ux_l  = wl(mb,ivx,k,j,i);
+  Real uy_l  = wl(mb,ivy,k,j,i);
+  Real uz_l  = wl(mb,ivz,k,j,i);
   Real u_l[4];
   u_l[0] = sqrt(1.0 + SQR(ux_l) + SQR(uy_l) + SQR(uz_l));  // Lorentz factor in L-state
   u_l[1] = ux_l;
@@ -49,18 +49,18 @@ void HLLC_SR(const EOS_Data &eos,
   u_l[3] = uz_l;
 
   // Extract right primitives
-  Real rho_r = wr(m,IDN,k,j,i);
-  Real ux_r  = wr(m,ivx,k,j,i);
-  Real uy_r  = wr(m,ivy,k,j,i);
-  Real uz_r  = wr(m,ivz,k,j,i);
+  Real rho_r = wr(mb,IDN,k,j,i);
+  Real ux_r  = wr(mb,ivx,k,j,i);
+  Real uy_r  = wr(mb,ivy,k,j,i);
+  Real uz_r  = wr(mb,ivz,k,j,i);
   Real u_r[4];
   u_r[0] = sqrt(1.0 + SQR(ux_r) + SQR(uy_r) + SQR(uz_r));  // Lorentz factor in R-state
   u_r[1] = ux_r;
   u_r[2] = uy_r;
   u_r[3] = uz_r;
 
-  Real pgas_l = eos.IdealGasPressure(wl(m,IEN,k,j,i));
-  Real pgas_r = eos.IdealGasPressure(wr(m,IEN,k,j,i));
+  Real pgas_l = eos.IdealGasPressure(wl(mb,IEN,k,j,i));
+  Real pgas_r = eos.IdealGasPressure(wr(mb,IEN,k,j,i));
 
   Real wgas_l = rho_l + gamma_prime * pgas_l;  // total enthalpy in L-state
   Real wgas_r = rho_r + gamma_prime * pgas_r;  // total enthalpy in R-state
@@ -177,21 +177,23 @@ void HLLC_SR(const EOS_Data &eos,
   // Calculate interface velocity
   Real const v_interface = 0.0;
 
-  // Determine region of wavefan
-  Real *flux_interface;
-  if (lambda_l >= v_interface) {  // L region
-    flux_interface = flux_l;
-  } else if (lambda_r <= v_interface) { // R region
-    flux_interface = flux_r;
-  } else if (lambda_star >= v_interface) {  // aL region
-    flux_interface = flux_lstar;
-  } else {  // c region
-    flux_interface = flux_rstar;
-  }
+  // Determine region of wavefan.  Select the interface state by value rather than by
+  // pointer: binding a pointer to one of these arrays at run time makes all four
+  // addressable, so ptxas cannot keep them in registers and moves them to the local
+  // (spill) frame.  A value select reads exactly the same number, so this is bitwise
+  // identical.  The loop below has a compile-time bound and unrolls, so the indices
+  // stay constant and the arrays stay in registers.
+  const bool pick_l  = (lambda_l >= v_interface);                       // L region
+  const bool pick_r  = (!pick_l) && (lambda_r <= v_interface);          // R region
+  const bool pick_ls = (!pick_l) && (!pick_r) &&
+                       (lambda_star >= v_interface);                    // aL region, else c
 
   // Set fluxes
   for (int n = 0; n < 5; ++n) {
-    flx(m,n,k,j,i) = flux_interface[n];
+    flx(m,n,k,j,i) = pick_l  ? flux_l[n]
+                   : pick_r  ? flux_r[n]
+                   : pick_ls ? flux_lstar[n]
+                             : flux_rstar[n];
   }
 
   // We evolve tau = E - D

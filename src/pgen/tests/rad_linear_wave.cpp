@@ -244,7 +244,7 @@ void ProblemGenerator::RadiationLinearWave(ParameterInput *pin, const bool resta
   if (set_initial_conditions) {
     pmbp->phydro->peos->PrimToCons(w0, pmbp->phydro->u0, 0,(n1-1), 0,(n2-1), 0,(n3-1));
   } else {
-    pmbp->phydro->peos->PrimToCons(w0, pmbp->phydro->u1, 0,(n1-1), 0,(n2-1), 0,(n3-1));
+    pmbp->phydro->peos->PrimToCons(w0, pmbp->phydro->u1.data, 0,(n1-1), 0,(n2-1), 0,(n3-1));
   }
 
   // initialize specific intensity over angles in initial conditions
@@ -494,6 +494,8 @@ void ProblemGenerator::RadiationLinearWave(ParameterInput *pin, const bool resta
 void RadiationLinearWaveErrors(ParameterInput *pin, Mesh *pm) {
   // calculate reference solution by calling pgen again.  Solution stored in second
   // register u1 when flag is false.
+  // The reference goes into u1 over the whole block (Hydro::ExpandStartRegister).
+  pm->pmb_pack->phydro->ExpandStartRegister();
   set_initial_conditions = false;
   pm->pgen->RadiationLinearWave(pin, false);
   pm->pgen->OutputErrors(pin, pm);

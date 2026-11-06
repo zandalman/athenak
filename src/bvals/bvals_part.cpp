@@ -23,6 +23,22 @@
 #include "bvals.hpp"
 
 namespace particles {
+namespace {
+// Particle exchange buffers are passed to MPI and resized at every exchange: draw them
+// from the MPI buffer pool at exactly the requested extent (see utils/mpi_buffer_pool).
+template <typename T>
+void PoolRealloc(DvceArray1D<T> &v, int n) {
+#if MPI_PARALLEL_ENABLED
+  mpi_buffer_pool::Release(v);
+  if (n > 0) {
+    auto pooled = mpi_buffer_pool::Acquire1D<T>(static_cast<std::size_t>(n));
+    v = DvceArray1D<T>(pooled.data(), n);
+    return;
+  }
+#endif
+  Kokkos::realloc(v, n);
+}
+}  // namespace
 //----------------------------------------------------------------------------------------
 //! \fn void ParticlesBoundaryValues::UpdateGID()
 //! \brief Updates GID of particles that cross boundary of their parent MeshBlock.  If
@@ -240,7 +256,6 @@ TaskStatus ParticlesBoundaryValues::CountSendsAndRecvs() {
   MPI_Allgatherv(MPI_IN_PLACE, nsends_eachrank[global_variable::my_rank],
                    mpi_ituple, sends_allranks.data(), nsends_eachrank.data(),
                    nsends_displ.data(), mpi_ituple, mpi_comm_part);
-  MPI_Type_free(&mpi_ituple);
 #endif
   return TaskStatus::complete;
 }
@@ -270,8 +285,8 @@ TaskStatus ParticlesBoundaryValues::InitPrtclRecv() {
   }
 
   // Allocate receive buffer
-  Kokkos::realloc(prtcl_rrecvbuf, (pmy_part->nrdata)*nprtcl_recv);
-  Kokkos::realloc(prtcl_irecvbuf, (pmy_part->nidata)*nprtcl_recv);
+  PoolRealloc(prtcl_rrecvbuf, (pmy_part->nrdata)*nprtcl_recv);
+  PoolRealloc(prtcl_irecvbuf, (pmy_part->nidata)*nprtcl_recv);
 
   // Post non-blocking receives
   bool no_errors=true;
@@ -340,8 +355,8 @@ TaskStatus ParticlesBoundaryValues::PackAndSendPrtcls() {
   bool no_errors=true;
   if (nprtcl_send > 0) {
     // Allocate send buffer
-    Kokkos::realloc(prtcl_rsendbuf, (pmy_part->nrdata)*nprtcl_send);
-    Kokkos::realloc(prtcl_isendbuf, (pmy_part->nidata)*nprtcl_send);
+    PoolRealloc(prtcl_rsendbuf, (pmy_part->nrdata)*nprtcl_send);
+    PoolRealloc(prtcl_isendbuf, (pmy_part->nidata)*nprtcl_send);
 
     // sendlist on device is already sorted by destrank in CountSendAndRecvs()
     // Use sendlist on device to load particles into send buffer ordered by dest_rank
@@ -362,7 +377,7 @@ TaskStatus ParticlesBoundaryValues::PackAndSendPrtcls() {
     });
 
     // Post non-blocking sends
-    Kokkos::fence();
+    DevExeSpace().fence();
     rsend_req.clear();
     isend_req.clear();
     for (int n=0; n<nsends; ++n) {

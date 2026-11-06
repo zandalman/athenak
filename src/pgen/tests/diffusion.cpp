@@ -194,7 +194,7 @@ void ProblemGenerator::Diffusion(ParameterInput *pin, const bool restart) {
     if (dv.viscosity_test) coef = pmbp->phydro->pvisc->nu_iso;
 
     // compute solution in u1 register. For initial conditions, set u1 -> u0.
-    auto &u1 = (set_initial_conditions)? pmbp->phydro->u0 : pmbp->phydro->u1;
+    auto &u1 = (set_initial_conditions)? pmbp->phydro->u0 : pmbp->phydro->u1.data;
 
     par_for("pgen_diff", DevExeSpace(),0,(pmbp->nmb_thispack-1),ks,ke,js,je,is,ie,
     KOKKOS_LAMBDA(int m,int k, int j, int i) {
@@ -309,6 +309,8 @@ void ProblemGenerator::Diffusion(ParameterInput *pin, const bool restart) {
 void DiffusionErrors(ParameterInput *pin, Mesh *pm) {
   // calculate reference solution by calling pgen again.  Solution stored in second
   // register u1/b1 when flag is false.
+  // The reference goes into u1 over the whole block (Hydro and MHD::ExpandStartRegister).
+  if (pm->pmb_pack->phydro != nullptr) pm->pmb_pack->phydro->ExpandStartRegister();
   set_initial_conditions = false;
   pm->pgen->Diffusion(pin, false);
   pm->pgen->OutputErrors(pin, pm);

@@ -9,6 +9,8 @@
 //  \brief Defines a class that provides all the common class
 //         member variables needed by an EOSPolicy.
 
+#include <limits>
+
 #include "ps_types.hpp"
 #include "unit_system.hpp"
 
@@ -29,6 +31,10 @@ class EOSPolicyInterface {
   Real max_n;
   /// minimum number density
   Real min_n;
+  /// maximum number density at which the gas entropy (SupportsGasEntropy) is defined.
+  /// A policy whose label covers less density than its EOS lowers it: the LTE table has
+  /// no adiabat label above its last density row, where its energy still extrapolates.
+  Real max_n_gas_entropy = std::numeric_limits<Real>::max();
   /// maximum temperature
   Real max_T;
   /// minimum temperature

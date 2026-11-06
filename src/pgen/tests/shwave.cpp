@@ -426,3 +426,14 @@ void ShwaveHistory(HistoryData *pdata, Mesh *pm) {
   }
   return;
 }
+
+#if USER_PROBLEM_ENABLED
+//----------------------------------------------------------------------------------------
+//! \fn void ProblemGenerator::UserProblem()
+//! \brief Built as its own executable (an ATHENA_EXTRA_PROBLEMS entry, or -D PROBLEM),
+//! the built-in dispatch is compiled out and this generator is the user entry point.
+
+void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
+  Shwave(pin, restart);
+}
+#endif

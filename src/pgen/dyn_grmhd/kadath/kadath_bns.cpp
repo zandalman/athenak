@@ -420,6 +420,7 @@ void SetupBNS(ParameterInput *pin, Mesh* pmy_mesh_) {
 
   // TODO(user): Add magnetic field initialization (e.g., current-loop model).
   // For now, initialize face-centered and cell-centered B fields to zero.
+  pmbp->pmhd->RequireField("The Kadath BNS problem generator");
   auto &b0 = pmbp->pmhd->b0;
   par_for(
       "pgen_Bfc", DevExeSpace(), 0, nmb - 1, ks, ke, js, je, is, ie,

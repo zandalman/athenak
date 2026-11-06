@@ -263,6 +263,11 @@ def test_error_convergence(
     l1_rms_l = 0.0
     l1_rms_r = 0.0
     for wv in _wave:
+        # The problem generator appends one row per run to <test_name>-errs.dat, and
+        # rows 0 and 1 are read as the low and the high resolution.  A file left by a
+        # killed run would shift them, so every wave starts without one.
+        if os.path.exists(f"{test_name}-errs.dat"):
+            os.remove(f"{test_name}-errs.dat")
         try:
             for res in _res:
                 results = RUN(
