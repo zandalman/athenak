@@ -1,0 +1,207 @@
+# AthenaK input file for the TDE stream-injection problem.
+# Requires a build configured with -D PROBLEM=injection.
+# Units: G = M_BH = c = 1 (lengths in r_g, times in r_g/c).
+#
+# Telescoping SMR around the BH: 4096^3 r_g box, 128^3 root grid (dx0 = 32 r_g), and
+# nested cubes |x|,|y|,|z| <= 2^(11-l) at level l = 1..6, i.e. level = 11 - log2(r) and
+# dx ~ |x|/64.  The finest BH cells (level 6, |x| <= 32) have dx = 0.5 r_g; no finer
+# level, since r < r_in = 16 is excised.  Each nested cube is 128^3 cells at its own
+# level; with 32^3 MeshBlocks every cube edge falls on a parent-block edge, so the
+# regions are not padded outward.  400 MeshBlocks around the BH.
+#
+# Injection region <problem>/inj_*: blocks there whose max density exceeds amr_rho_min
+# are refined to amr_level = 6 (dx = 0.5), the finest level anywhere.
+# refined_region9/10 are dx = 0.5 boxes around the two stream injection points.
+# Refinement is adaptive, so the pgen keeps every <refined_regionN> as a minimum level
+# (refined regions only set the initial mesh under AMR).
+
+<comment>
+problem   = TDE stream injection near the self-intersection point (skeleton)
+reference = Tejeda & Rosswog 2013, MNRAS 433, 1930 (TR13 potential)
+
+<job>
+basename = injection
+
+<units>                       # M_BH = 1e6 Msun, G = M = c = 1 (as ref/athinput.tde_si)
+length_cgs = 1.4770934e+11    # r_g
+mass_cgs   = 1.9891e+39       # M_BH
+time_cgs   = 4.9270606        # r_g/c
+
+<mesh>
+nghost = 2
+nx1    = 128
+x1min  = -2048.0
+x1max  = 2048.0
+ix1_bc = outflow
+ox1_bc = outflow
+
+nx2    = 128
+x2min  = -2048.0
+x2max  = 2048.0
+ix2_bc = outflow
+ox2_bc = outflow
+
+nx3    = 128
+x3min  = -2048.0
+x3max  = 2048.0
+ix3_bc = outflow
+ox3_bc = outflow
+
+<meshblock>
+nx1 = 32
+nx2 = 32
+nx3 = 32
+
+<mesh_refinement>
+refinement          = adaptive
+num_levels          = 7       # root + 6 levels (finest dx = 0.5)
+ncycle_check        = 128     # fine ticks between AMR checks (one level per check)
+refinement_interval = 128
+max_nmb_per_rank    = 2000    # placeholder: set from GPU memory
+
+<amr_criterion0>
+method = user                 # InjectionRefinement in injection.cpp
+
+<refined_region1>             # dx = 16
+level = 1
+x1min = -1024.0
+x1max = 1024.0
+x2min = -1024.0
+x2max = 1024.0
+x3min = -1024.0
+x3max = 1024.0
+
+<refined_region2>             # dx = 8
+level = 2
+x1min = -512.0
+x1max = 512.0
+x2min = -512.0
+x2max = 512.0
+x3min = -512.0
+x3max = 512.0
+
+<refined_region3>             # dx = 4
+level = 3
+x1min = -256.0
+x1max = 256.0
+x2min = -256.0
+x2max = 256.0
+x3min = -256.0
+x3max = 256.0
+
+<refined_region4>             # dx = 2
+level = 4
+x1min = -128.0
+x1max = 128.0
+x2min = -128.0
+x2max = 128.0
+x3min = -128.0
+x3max = 128.0
+
+<refined_region5>             # dx = 1
+level = 5
+x1min = -64.0
+x1max = 64.0
+x2min = -64.0
+x2max = 64.0
+x3min = -64.0
+x3max = 64.0
+
+<refined_region6>             # dx = 0.5
+level = 6
+x1min = -32.0
+x1max = 32.0
+x2min = -32.0
+x2max = 32.0
+x3min = -32.0
+x3max = 32.0
+
+<refined_region9>             # stream 1 injection point (x1, y1), dx = 0.5
+level = 6
+x1min = -935.0
+x1max = -903.0
+x2min = -428.907405
+x2max = -396.907405
+x3min = -8.0
+x3max = 8.0
+
+<refined_region10>            # stream 2 injection point (x2, y2), dx = 0.5
+level = 6
+x1min = -1185.0
+x1max = -1153.0
+x2min = -553.218295
+x2max = -521.218295
+x3min = -8.0
+x3max = 8.0
+
+<time>
+evolution  = dynamic
+integrator = rk2              # LAT supports rk1, rk2, imex2 only
+cfl_number = 0.4              # margin: a LAT neighbour may step up to 2x its own limit
+nlim       = -1
+tlim       = 100000.0
+ndiag      = 1
+
+lat               = true
+lat_levels        = 7         # ceiling: factors up to 2^7 (costs nothing if unused)
+lat_same_level    = true      # blocks on one level may step at different rates
+                              # (lat_same_level_max_ratio defaults to 2)
+lat_min_bin_count = 8         # set explicitly so runs are reproducible across rank counts
+lat_pin_density   = 1.0e-15   # blocks with stream gas (rho ~ 6e-14) and their neighbours
+                              # step at factor 1; above the excision density (~2e-16)
+
+<hydro>
+eos         = ideal
+gamma       = 1.3333333333333333
+reconstruct = plm
+rsolver     = hllc
+dfloor      = 1.0e-26         # below the background everywhere (~2e-23 at box corners)
+pfloor      = 1.0e-32
+
+<problem>
+user_srcs = true              # TR13 gravity (enrolled by the pgen regardless)
+
+r_in    = 16.0                # excision radius [r_g], must be > 2 (32 finest cells in radius)
+rho_atm = 1.0e-18             # atmosphere density at r_atm; gives rho ~ 8e-22 and
+                              # P ~ 4e-4 P_stream at the injection points
+r_atm   = 100.0               # atmosphere normalization radius [r_g]
+
+inj_x1min = -1169.0           # injection region
+inj_x1max = -919.0
+inj_x2min = -629.0
+inj_x2max = -379.0
+inj_x3min = -125.0
+inj_x3max = 125.0
+amr_level   = 6               # dx = 0.5 for dense gas in the injection region
+amr_rho_min = 1.0e-14         # ~1e-1 of the stream density, ~1e7 x background there
+
+# Streams: injected over a cylinder of radius H and length H centred on (x, y, 0), with
+# axis along (xdot, ydot).  Positions on the injection-region edges; y and velocities
+# from ref/athinput.tde_si.  mdot = 1 Msun/yr; implied rho = mdot/(pi H^2 v) ~ 6e-14.
+nstreams = 2
+
+x1    = -919.0
+y1    = -412.907405
+xdot1 = -0.029112612
+ydot1 = -0.0207682087
+mdot1 = 1.5623606789395503e-13
+temp1 = 1.0e5                 # K, radiation temperature: e = a_rad T^4
+H1    = 5.0
+
+x2    = -1169.0
+y2    = -537.218295
+xdot2 = 0.0291962001
+ydot2 = 0.00737189119
+mdot2 = 1.5623606789395503e-13
+temp2 = 1.0e5                 # K, radiation temperature: e = a_rad T^4
+H2    = 5.0
+
+<output1>
+file_type = hst
+dt        = 10.0
+
+<output2>
+file_type = bin
+variable  = hydro_w
+dt        = 50.0
+slice_x3  = 0.0
