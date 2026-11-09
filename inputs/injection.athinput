@@ -139,7 +139,7 @@ evolution  = dynamic
 integrator = rk2              # LAT supports rk1, rk2, imex2 only
 cfl_number = 0.4              # margin: a LAT neighbour may step up to 2x its own limit
 nlim       = -1
-tlim       = 100000.0
+tlim       = 1000000.0
 ndiag      = 1
 
 lat               = true
@@ -148,22 +148,32 @@ lat_same_level    = true      # blocks on one level may step at different rates
                               # (lat_same_level_max_ratio defaults to 2)
 lat_min_bin_count = 8         # set explicitly so runs are reproducible across rank counts
 lat_pin_density   = 1.0e-15   # blocks with stream gas (rho ~ 6e-14) and their neighbours
-                              # step at factor 1; above the excision density (~2e-16)
+                              # step at factor 1; above the excision density (~3.5e-21)
 
 <hydro>
 eos         = ideal
 gamma       = 1.3333333333333333
 reconstruct = plm
 rsolver     = hllc
-dfloor      = 1.0e-26         # below the background everywhere (~2e-23 at box corners)
-pfloor      = 1.0e-32
+dfloor      = 1.0e-28         # below the background everywhere (~1.4e-23 at box corners)
+pfloor      = 1.0e-34
+vceil       = 0.5             # |v| cap [c]; Newtonian, so v ~ c is unphysical anyway
+                              # (free fall at r_in = 16 is ~0.35)
+cs_ceil     = 0.5             # sound-speed cap [c]; atmosphere c_s(r_in) ~ 0.13
+dual_energy = true            # separate internal energy: the stream is Mach ~300, so
+                              # E - K is truncation noise there (eta1 default 1e-3)
 
 <problem>
 user_srcs = true              # TR13 gravity (enrolled by the pgen regardless)
 
 r_in    = 16.0                # excision radius [r_g], must be > 2 (32 finest cells in radius)
-rho_atm = 1.0e-18             # atmosphere density at r_atm; gives rho ~ 8e-22 and
-                              # P ~ 4e-4 P_stream at the injection points
+bern    = 0.01                # atmosphere Bernoulli constant: h = bern - Phi_s(r), so
+                              # rho is ~flat for r >> 1/bern = 100 and rises only inside
+rho_atm = 1.0e-22             # atmosphere density at r_atm.  With bern = 0.01:
+                              # rho ~ 1.7e-23, P ~ 1e-4 P_stream, c_s ~ 0.06 at the
+                              # injection points; rho ~ 1.4e-23 at the box corners;
+                              # rho ~ 3.5e-21, c_s ~ 0.147 at r_in (~1e-5 of the
+                              # estimated CIO fallback there)
 r_atm   = 100.0               # atmosphere normalization radius [r_g]
 
 inj_x1min = -1169.0           # injection region
@@ -173,12 +183,15 @@ inj_x2max = -379.0
 inj_x3min = -125.0
 inj_x3max = 125.0
 amr_level   = 6               # dx = 0.5 for dense gas in the injection region
-amr_rho_min = 1.0e-14         # ~1e-1 of the stream density, ~1e7 x background there
+amr_rho_min = 1.0e-14         # ~1e-1 of the stream density: fires on stream gas only
 
 # Streams: injected over a cylinder of radius H and length H centred on (x, y, 0), with
 # axis along (xdot, ydot).  Positions on the injection-region edges; y and velocities
 # from ref/athinput.tde_si.  mdot = 1 Msun/yr; implied rho = mdot/(pi H^2 v) ~ 6e-14.
 nstreams = 2
+inj_t_on  = 44586.0           # injection duty cycle [r_g/c]: on for inj_t_on, then off
+inj_t_off = 44586.0           # for inj_t_off, repeating; starts on at t = 0
+                              # (inj_t_off = 0 or omitted: always on)
 
 x1    = -919.0
 y1    = -412.907405
@@ -203,5 +216,21 @@ dt        = 10.0
 <output2>
 file_type = bin
 variable  = hydro_w
-dt        = 50.0
+id        = hydro2d
+dt        = 100.0
 slice_x3  = 0.0
+
+<output3>
+file_type = bin
+variable  = hydro_w
+id        = hydro3d
+dt        = 10000.0
+
+<output4>
+file_type = rst               # restart dumps every 10 hydro_w outputs
+id        = restart
+dt        = 10000.0
+
+<output5>
+file_type = log               # floor/ceiling/c2p-failure counts (injection.log), written
+dcycle    = 1                 # only on cycles where a counter is non-zero

@@ -14,8 +14,9 @@
 //! Units: G = M_BH = c = 1 (lengths in r_g, times in r_g/c).
 //!
 //! Current contents:
-//!   - hydrostatic, zero-Bernoulli polytropic background atmosphere in the static TR13
-//!     potential, normalized by <problem>/rho_atm at <problem>/r_atm
+//!   - hydrostatic polytropic background atmosphere in the static TR13 potential, with
+//!     Bernoulli constant <problem>/bern (default 0), normalized by <problem>/rho_atm at
+//!     <problem>/r_atm
 //!   - TR13 gravity source term (LAT-safe)
 //!   - excision for r < <problem>/r_in, held at the atmosphere state at r_in
 //!   - AMR: every <refined_regionN> is kept as a minimum level (they would otherwise be
@@ -61,6 +62,7 @@ struct InjectionParams {
   Real r_in;      // inner (excision) radius in r_g; must be > 2
   Real rho_atm;   // atmosphere density at r_atm
   Real r_atm;     // normalization radius of the atmosphere
+  Real bern;      // atmosphere Bernoulli constant (0 = zero-Bernoulli)
   Real rho_exc;   // excision density   (atmosphere at r_in)
   Real eint_exc;  // excision internal energy density (atmosphere at r_in)
 };
@@ -88,7 +90,14 @@ struct Stream {
 struct Streams {
   int n;
   Stream s[kMaxStreams];
+  Real t_on, t_off;  // duty cycle: on for t_on, off for t_off, starting on at t = 0
 };
+
+// Whether injection is on at time t.  t_off <= 0 means always on.
+KOKKOS_INLINE_FUNCTION
+bool InjectionOn(const Streams &st, Real t) {
+  return st.t_off <= 0.0 || fmod(t, st.t_on + st.t_off) < st.t_on;
+}
 Streams streams;
 
 KOKKOS_INLINE_FUNCTION
@@ -106,16 +115,17 @@ void InjectionRefinement(MeshBlockPack *pmbp);
 
 //----------------------------------------------------------------------------------------
 //! \fn AtmosphereDensity
-//! \brief Zero-Bernoulli polytrope in the static TR13 potential.
+//! \brief Polytrope with Bernoulli constant B in the static TR13 potential.
 //! Hydrostatic equilibrium with P = K rho^gamma gives enthalpy
-//!   h = gamma/(gamma-1) P/rho = -Phi_s(r),
-//! so rho(r) = rho_atm [Phi_s(r)/Phi_s(r_atm)]^n with n = 1/(gamma-1).  The profile is
-//! frozen at r_in for r < r_in (that region will be excised).
+//!   h = gamma/(gamma-1) P/rho = B - Phi_s(r),
+//! so rho(r) = rho_atm [h(r)/h(r_atm)]^n with n = 1/(gamma-1).  B = 0 is the
+//! zero-Bernoulli profile (rho ~ r^-n); B > 0 flattens it to ~constant where |Phi_s| << B.
+//! The profile is frozen at r_in for r < r_in (that region will be excised).
 
 KOKKOS_INLINE_FUNCTION
-Real AtmosphereDensity(Real r, Real r_in, Real rho_atm, Real phi_atm, Real n) {
+Real AtmosphereDensity(Real r, Real r_in, Real rho_atm, Real h_atm, Real bern, Real n) {
   const Real r_eff = fmax(r, r_in);
-  return rho_atm*pow(TR13StaticPot(r_eff)/phi_atm, n);
+  return rho_atm*pow((bern - TR13StaticPot(r_eff))/h_atm, n);
 }
 
 }  // namespace
@@ -131,6 +141,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   params.r_in = pin->GetReal("problem", "r_in");
   params.rho_atm = pin->GetReal("problem", "rho_atm");
   params.r_atm = pin->GetReal("problem", "r_atm");
+  params.bern = pin->GetOrAddReal("problem", "bern", 0.0);
 
   // Injection region and AMR settings.
   inj_box.x1min = pin->GetReal("problem", "inj_x1min");
@@ -152,16 +163,17 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   }
   if (pmy_mesh_->adaptive) user_ref_func = InjectionRefinement;
 
-  // Atmosphere: P = kappa rho^gamma with kappa from h(r_atm) = -Phi_s(r_atm),
-  // i.e. kappa = -Phi_s(r_atm) (gamma-1)/gamma / rho_atm^(gamma-1).
+  // Atmosphere: P = kappa rho^gamma with kappa from h(r_atm) = B - Phi_s(r_atm),
+  // i.e. kappa = h(r_atm) (gamma-1)/gamma / rho_atm^(gamma-1).
   const Real gamma = pmbp->phydro->peos->eos_data.gamma;
   const Real gm1 = gamma - 1.0;
   const Real n = 1.0/gm1;
   const Real r_in = params.r_in;
   const Real rho_atm = params.rho_atm;
-  const Real phi_atm = TR13StaticPot(params.r_atm);
-  const Real kappa = -phi_atm*gm1/gamma/pow(rho_atm, gm1);
-  params.rho_exc = AtmosphereDensity(r_in, r_in, rho_atm, phi_atm, n);
+  const Real bern = params.bern;
+  const Real h_atm = bern - TR13StaticPot(params.r_atm);
+  const Real kappa = h_atm*gm1/gamma/pow(rho_atm, gm1);
+  params.rho_exc = AtmosphereDensity(r_in, r_in, rho_atm, h_atm, bern, n);
   params.eint_exc = kappa*pow(params.rho_exc, gamma)/gm1;
 
   // Streams.  The source density q = mdot/V uses the discrete volume of the cells whose
@@ -175,6 +187,8 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
   const int nmb = pmbp->nmb_thispack;
   const int nkji = indcs.nx3*indcs.nx2*indcs.nx1, nji = indcs.nx2*indcs.nx1;
   streams.n = pin->GetInteger("problem", "nstreams");
+  streams.t_on = pin->GetOrAddReal("problem", "inj_t_on", 1.0);
+  streams.t_off = pin->GetOrAddReal("problem", "inj_t_off", 0.0);
   for (int ns = 0; ns < streams.n; ++ns) {
     const std::string id = std::to_string(ns + 1);
     Stream &s = streams.s[ns];
@@ -255,7 +269,7 @@ void ProblemGenerator::UserProblem(ParameterInput *pin, const bool restart) {
     const Real z = CellCenterX(k-ks, indcs.nx3, size.d_view(m).x3min,
                                size.d_view(m).x3max);
     const Real r = sqrt(x*x + y*y + z*z);
-    const Real rho = AtmosphereDensity(r, r_in, rho_atm, phi_atm, n);
+    const Real rho = AtmosphereDensity(r, r_in, rho_atm, h_atm, bern, n);
     const Real pres = kappa*pow(rho, gamma);
     w0(m,IDN,k,j,i) = rho;
     w0(m,IVX,k,j,i) = 0.0;
@@ -275,7 +289,10 @@ namespace {
 //!  - TR13 gravity: d(rho v)/dt = rho a,  dE/dt = rho v.a, with a = TR13Accel(x, v).
 //!    Work only, so a dual-energy internal-energy field is untouched.  Skipped for r < r_in.
 //!  - stream injection: in each stream's cylinder, d(rho)/dt = q, d(rho v)/dt = q v_s,
-//!    dE/dt = q (v_s^2/2 + espec), with q = mdot/V_cyl.
+//!    dE/dt = q (v_s^2/2 + espec), with q = mdot/V_cyl.  With dual energy, the
+//!    internal-energy field gains q espec plus the heat of mixing with the cell's gas.
+//!    Duty cycle: on for inj_t_on, off for inj_t_off (InjectionOn), decided per block at
+//!    its step start, so a step straddling a switch is all on or all off.
 //!
 //! LAT: loops over the active (due) blocks only and uses each block's own step, following
 //! TDEExternalGravitySource in tde_external.cpp.
@@ -298,11 +315,17 @@ void InjectionSources(Mesh *pm, const Real bdt) {
   auto active_indices = pmbp->lat_active_indices.d_view;
   const int nwork1 = lat_enabled ? (pmbp->lat_nactive_thispack - 1) : (nmb - 1);
   if (nwork1 < 0) return;
+  // Time for the injection duty cycle: each LAT block's own step start (the stage time is
+  // not per block in the fused union predictor), otherwise the stage time.
+  auto lat_t0 = pmbp->lat_time_start.d_view;
+  const Real t_src = (pm->pgen->user_srcs_time_valid) ? pm->pgen->user_srcs_time : pm->time;
 
   auto &w0 = pmbp->phydro->w0;
   auto &u0 = pmbp->phydro->u0;
   const Real r_in2 = params.r_in*params.r_in;
   const Streams st = streams;
+  const bool dual = pmbp->phydro->use_dual_energy;
+  const int de_idx = pmbp->phydro->dual_energy_idx;
 
   par_for("injection_srcs", DevExeSpace(), 0, nwork1, ks, ke, js, je, is, ie,
   KOKKOS_LAMBDA(int a, int k, int j, int i) {
@@ -330,10 +353,21 @@ void InjectionSources(Mesh *pm, const Real bdt) {
     u0(m,IM3,k,j,i) += src*az;
     u0(m,IEN,k,j,i) += src*(vx*ax + vy*ay + vz*az);
 
+    if (!InjectionOn(st, lat_enabled ? lat_t0(m) : t_src)) return;
     for (int n = 0; n < st.n; ++n) {
       const Stream &s = st.s[n];
       if (!InStream(s, x, y, z)) continue;
       const Real dm = block_bdt*s.q;
+      if (dual) {
+        // Internal energy gained: the injected gas's own, plus the kinetic energy lost
+        // when it mixes inelastically with the cell's gas (E gets it implicitly as E - K).
+        const Real d = u0(m,IDN,k,j,i);
+        const Real dvx = u0(m,IM1,k,j,i)/d - s.vx;
+        const Real dvy = u0(m,IM2,k,j,i)/d - s.vy;
+        const Real dvz = u0(m,IM3,k,j,i)/d;
+        u0(m,de_idx,k,j,i) += dm*s.espec +
+            0.5*d*dm/(d + dm)*(dvx*dvx + dvy*dvy + dvz*dvz);
+      }
       u0(m,IDN,k,j,i) += dm;
       u0(m,IM1,k,j,i) += dm*s.vx;
       u0(m,IM2,k,j,i) += dm*s.vy;
@@ -407,6 +441,8 @@ void ExcisionFixup(MeshBlockPack *pmbp, const Real time) {
   const Real rho_exc = params.rho_exc;
   const Real eint_exc = params.eint_exc;
   const Real r_in2 = params.r_in*params.r_in;
+  const bool dual = pmbp->phydro->use_dual_energy;
+  const int de_idx = pmbp->phydro->dual_energy_idx;
 
   par_for("injection_excision", DevExeSpace(), 0, nwork1, ks, ke, js, je, is, ie,
   KOKKOS_LAMBDA(int a, int k, int j, int i) {
@@ -423,6 +459,7 @@ void ExcisionFixup(MeshBlockPack *pmbp, const Real time) {
     u0(m,IM2,k,j,i) = 0.0;
     u0(m,IM3,k,j,i) = 0.0;
     u0(m,IEN,k,j,i) = eint_exc;
+    if (dual) u0(m,de_idx,k,j,i) = eint_exc;
   });
 }
 
