@@ -292,7 +292,15 @@ TaskStatus Hydro::HydroStateFixup(Driver *pdrive, int stage) {
     pm->pgen->user_srcs_time = t;
     pm->pgen->user_srcs_time_valid =
         (stage > 0) || problem_runtime::HasHydroStageTime();
+    // Survival weight of this stage's u0 in the completed step (later stages scale u0 by
+    // gam0), for problems that book what the fixup removes.
+    Real weight = 1.0;
+    if (stage > 0) {
+      for (int s = stage; s < pdrive->nexp_stages; ++s) weight *= pdrive->gam0[s];
+    }
+    pm->pgen->user_hydro_state_fixup_weight = weight;
     pm->pgen->user_hydro_state_fixup_func(pmy_pack, t);
+    pm->pgen->user_hydro_state_fixup_weight = 1.0;
     pm->pgen->user_srcs_time = old_user_srcs_time;
     pm->pgen->user_srcs_time_valid = old_user_srcs_time_valid;
   }

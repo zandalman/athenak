@@ -32,7 +32,66 @@ so we might need to modify the code to make the source terms work.
 - **BH region:** excised inside r_in (input parameter), possibly also via source terms.
 - **Gravity:** Tejeda & Rosswog 2013 generalized Newtonian potential (helpers in `src/pgen/injection.hpp`, units G=M=c=1).
 - **Geometry:** Cartesian box with nested SMR around the intersection point and the BH.
-  Refinement around the intersection point still TBD.
+  Refinement around the intersection point: density AMR plus look-ahead boxes around the
+  injection cylinders (see "Injection boxes" under "Time-dependent streams" below).
+- **Time-dependent streams (implemented, 2026-11-10):** streams now come from the table
+  `data/inj.ascii` (`<problem>/inj_file`, path relative to the run directory). Supersedes
+  the fixed per-stream deck keys (x1, xdot1, mdot1, ..., nstreams) and the
+  inj_t_on/inj_t_off duty cycle. Table facts (fiducial beta = 2 disruption of a sun-like
+  star, since beta = 1 does not fully disrupt it; header rp = 23.56, a_mb = 666.9,
+  tinj = 1000; everything in code units, including mdot):
+  - columns t, state (1 on / 0 off), r_si/phi (= xc/yc in polar form), a_in/a_out
+    (semi-major axes of the inbound/outbound elements, unused), xc/yc (SI point),
+    x/y/vx/vy_in and _out (injection point and velocity of the inbound/outbound stream),
+    mdot_in/mdot_out. 15974 rows, log spaced (dt/t ~ 3.6e-4), t = 1.2550e5 .. 4.06e7.
+  - A row's t is when the gas is injected (user decision; no tinj shift). The injection
+    points sit ~30 r_g upstream of (xc, yc): the SI point integrated back along each stream
+    for tinj under gravity.
+  - All columns are smooth across state switches; on/off phases are ~600 rows each,
+    ~3.6e4, 4.0e4, 4.4e4, ... r_g/c and growing.
+  - SI point drifts from r = 883 to 2285 (phi ~ 3.36), ~2.7e-3 r_g per r_g/c early.
+  - mdot_in 2.5e-14 at t0, peak ~1.6e-13 near t ~ 2e5, ~4.5e-14 at t = 2e6; mdot_out
+    starts ~12x lower (2.1e-15) and converges to mdot_in. The last rows of mdot_in are
+    repeated exactly (clamp in the generating code, irrelevant before 4e7).
+  Implementation: two streams (0 = inbound, 1 = outbound). The table is read on every
+  rank (columns by header name), interpolated linearly in t, state from the row at or
+  before t, once per LAT window (`InjectionWindowEnd` -> `UpdateStreams`, user decision:
+  once per window is fine). The streams are constant within a window, so the source is
+  time independent (LAT/union safe) and on/off switches land on window boundaries (error
+  <= one window, ~100 r_g/c, vs ~4e4 phases). The per-block lat_time_start duty-cycle test
+  is gone. H = 5 and temp = 1e5 K are fixed for both streams (`<problem>/H`, `temp`;
+  user decision, for now), so rho_s = mdot/(pi H^2 v) follows mdot.
+  q = mdot / V_cyl with V_cyl counted on the host on the global amr_level lattice (dx = 0.5),
+  valid because the injection boxes keep the cylinders on that level; no MPI reduction.
+  **Injection boxes (2026-11-10, replace the tracking box):** one box per cylinder: its
+  bounding sphere at t and at t + `<problem>/inj_lead`, padded by `<problem>/inj_pad`
+  (2 r_g) in x/y, z = +-sqrt(1.25) H, enforced at amr_level by `InjectionRefinement`
+  only while the table is on at t or at t + inj_lead (look-ahead; user decision over
+  delaying each on switch until refined). Reasoning: downstream of the cylinders the
+  density criterion already keeps the streams refined (and the SI point / CIO, which are
+  dense), so only the cylinders need forcing: for exact V_cyl, because the cylinders creep
+  into blocks without dense gas yet, and because gas is still building up in the first
+  windows of an on phase. The look-ahead is needed since the site sits on BH-nest levels
+  2 -> 0 as the SI point drifts out, AMR adds one level per check, and amr_level = 7, so
+  refinement needs up to 7 checks; inj_lead = 1500 r_g/c (~15 windows, ~4% of an off
+  phase). Off phases (beyond the look-ahead) derefine the site unless dense. The old box
+  also covered (xc, yc) with track_pad = 8 (~36 blocks at t0), held in off phases too.
+  The deck's `<refined_region8>` (`initial_only = true`, not enforced by the pgen) still
+  builds the old, larger t0 box at start_time (the table is on at t0); its excess
+  derefines unless dense. On restart build_tree will warn that this region is ignored;
+  harmless. Not yet run: check that the cylinder blocks are at amr_level when each on
+  phase starts (AMR check spacing under LAT is assumed, ~1 window).
+  **Run:** `<time>/start_time` = first table time (1.255039907173705e5), tlim = 2e6 (user
+  decision). Output cadences raised for the long run (hst 100, 2D 1000, 3D 1e5, rst 2e4;
+  my choice, revisit for disk use).
+  **Thresholds:** fixed, from the lowest stream density in the run (user decision): the
+  outbound stream at t0, rho_s = 2.1e-15/(pi 25 x 0.029) = 9.2e-16. amr_rho_min = 1e-16
+  and lat_pin_density = 1e-16 (~0.1 of it). Risk: CIO gas above 1e-16 anywhere goes to
+  dx = 0.5 (100x lower than before), so watch the block count against
+  max_nmb_per_rank = 1500.
+  **Ledger:** M_inj is summed per window (exact) and restarted from `<problem>/m_inj`.
+  History also has mdot_in, mdot_out, inj_on (current window).
+  r_in = 16 kept (user decision) although rp = 23.6 for beta = 2.
 - **BH SMR (implemented in deck):** 4096^3 r_g box (±2048), 128^3 root (dx0 = 32),
   nested cubes ±2^(11-l) at level l = 1..7 (AthenaK root = level 0), i.e.
   level = 11 - log2(r), dx ≈ |x|_inf/64. Finest dx = 0.25 inside ±16; no finer level
@@ -49,15 +108,42 @@ so we might need to modify the code to make the source terms work.
   Collision-site dx = 0.25 SMR box (old refined_region8) also removed: finest level is now 6
   (dx = 0.5) everywhere, num_levels = 7. Collision region is resolved only by the density
   AMR (amr_level = 6).
-- **Injection-region refinement (implemented):** refinement = adaptive with a user criterion
-  (`InjectionRefinement`). Injection box from `<problem>/inj_x{1,2,3}{min,max}`
-  (currently -1169..-919, -629..-379, -125..125; centre (-1044, -504, 0)).
-  Inside it, blocks with max density > `amr_rho_min` go to `amr_level` = 6 (dx = 0.5).
+- **Box doubled (2026-11-09):** first trial run showed the box was too small. Now 8192^3 r_g
+  (±4096), still 128^3 root (dx0 = 64), with a new level-1 cube ±2048 (dx = 32 = old root).
+  Every existing region keeps its dx but is one level number higher: BH cubes ±2^(12-l)
+  at l = 1..7, refined_region9/10 and amr_level = 7, num_levels = 8, lat_levels = 8.
+  456 BH MeshBlocks (was 400). Level numbers quoted in older entries below are pre-shift
+  (old level L = new level L+1).
+- **GPU memory limit (2026-11-09):** one GPU on stellar-m01g4 holds ~1800 MeshBlocks with
+  this setup (32^3 blocks, nghost = 2, 6 hydro vars with dual energy, rk2, LAT). The
+  doubled-box run (1 rank) died at 1786 blocks, cycle ~2950, t ≈ 3560: Kokkos failed to
+  allocate 3.804 GiB for "cons" while growing for the next AMR event
+  (= 6 x 36^3 x 8 B x ~1824 blocks). The old max_nmb_per_rank = 2000 was above this, so
+  the AMR memory cap never fired; now 1500 (~15% headroom). Stellar GPU nodes: 2 GPUs per
+  node, 40 GB each (RC docs), so ~22 MB/block (~10 copies of cons). One full node (2 ranks)
+  ≈ 3000 blocks at the cap.
+  Block count was ~1600 at cycle ~1000 (vs 456 for the BH nest; the rest is probably the
+  two dx = 0.5 injection boxes plus their 2:1 buffers, unconfirmed) and grew ~30 per AMR
+  check (every 128 cycles) as the streams advanced. Stream growth is bounded: the streams
+  only exist up to the collision (straight-line estimate from the deck x/y/xdot/ydot:
+  paths cross near (-1052, -508), r ≈ 1170, with stream 1 arriving at t ≈ 4560 and
+  stream 2 at t ≈ 4020; gravity bends this by only ~10 r_g), so the OOM at t ≈ 3560 was
+  just before the collision.
+  After that the block count is set by how much CIO gas exceeds amr_rho_min (refined to
+  dx = 0.5), which is not yet known: watch the block count after t ≈ 4500 and decide
+  between more GPUs, a higher amr_rho_min, or a radius-dependent AMR level cap.
+- **Density AMR (implemented):** refinement = adaptive with a user criterion
+  (`InjectionRefinement`). Blocks anywhere with max density > `amr_rho_min` go to
+  `amr_level` (dx = 0.5).
+  **Injection box removed (2026-11-09):** AMR used to be restricted to an injection box
+  (`<problem>/inj_x{1,2,3}{min,max}`); redundant, since stream-like densities only occur
+  near the injection points and near the BH (already SMR-refined), so it now acts
+  everywhere. Watch for dense CIO/envelope gas outside ±32 pulling large regions to dx = 0.5
+  (raise amr_rho_min if so).
   (A dx = 0.25 collision-site SMR box was tried and later removed for cost.)
   Under AMR, `<refined_regionN>` only builds the initial tree and nothing protects it from
   derefinement, so the user criterion reads every refined_region back and enforces it as a
-  minimum level. Target level = max(overlapped refined_region levels, amr_level if dense
-  and in box); flag +1 below target, -1 above (core handles sibling/2:1 rules).
+  minimum level. Target level = max(overlapped refined_region levels, amr_level if dense); flag +1 below target, -1 above (core handles sibling/2:1 rules).
   Single threshold, no hysteresis: add a derefine threshold if blocks flap.
 - **LAT:** `lat_same_level = true` (ratio 2), so injection-box blocks are not slaved to the
   hot BH shell on the same level.
@@ -66,7 +152,8 @@ so we might need to modify the code to make the source terms work.
   (365-day yr) in these units. No mu: temperatures are radiation temperatures.
 - **Radiation dominated:** gamma = 4/3 represents radiation-pressure-dominated gas, so a
   temperature T [K] maps to internal energy density e = a_rad T^4 (P = e/3), not k T/(mu m_u).
-- **Stream injection (implemented):** per stream (`nstreams`, keys x/y/xdot/ydot/mdot/temp/H
+- **Stream injection (implemented; geometry, mdot and duty cycle superseded 2026-11-10 by
+  the time-dependent streams above):** per stream (`nstreams`, keys x/y/xdot/ydot/mdot/temp/H
   + index): uniform mass, momentum, energy source over a cylinder of radius H and length H,
   axis along v, centred on (x, y, 0). q = mdot / V_cyl with V_cyl the discrete volume of cells
   whose centres are inside (MPI-summed once in UserProblem), so exactly mdot is injected.
@@ -93,7 +180,8 @@ so we might need to modify the code to make the source terms work.
   to f = 1 (the stream moves < 1 block per window, so its head always enters pinned blocks);
   cfl_number = 0.4 for margin. The general rule: any source that creates fast gas inside a
   window needs its blocks capped.
-- **Injection duty cycle (implemented, 2026-11-08):** `<problem>/inj_t_on`, `inj_t_off`
+- **Injection duty cycle (implemented 2026-11-08; REMOVED 2026-11-10, replaced by the
+  table's state column):** `<problem>/inj_t_on`, `inj_t_off`
   (deck: 44586 each, r_g/c); on for t_on, off for t_off, repeating, starting on at t = 0;
   t_off <= 0 = always on. Applies to all streams together; gravity is unaffected.
   Under LAT the on/off test reads each block's own step start `lat_time_start(m)` (set on
@@ -135,7 +223,104 @@ so we might need to modify the code to make the source terms work.
   untouched. LAT supports Newtonian dual energy (wiki). Under AMR the core switches to
   prolong_prims automatically. Floors kept (dfloor still needed for vacuum; pfloor is a
   backstop): check the event log to see whether efloor hits drop.
-  Not yet tried: `fofc`, higher floors.
+  Not yet tried: higher floors.
+- **Bad cells at the stream collision (2026-11-11, open):** test runs show an expanding
+  sphere of bad cells that starts exactly where the inbound and outbound streams first
+  collide (a few hundred r_g/c after start_time, since injection is ~30 r_g upstream of
+  the SI point). Leading hypothesis: the Mach ~300 cold-stream collision makes PLM/HLLC
+  produce negative pressure/density at the shock, floors patch it, and the damage spreads
+  with the CIO. Trial: `<hydro>/fofc = true` (first-order LLF fluxes on cells whose stage
+  update would need a floor; supported under LAT and dual energy). If bad cells persist,
+  next suspects: the dual-energy shock rule at the collision (compare u_int vs E - K;
+  try dual_energy = false), then LAT (lat = false), then rsolver = hlle. Check which
+  injection.log counters fire at onset.
+  **fofc did not fix it.** User then saw that the collision sits right at the corner of a
+  refinement boundary. Likely why: region8 (initial_only) refines the SI point at t0,
+  but nothing dense is there until the streams arrive, so it derefines in the first
+  windows; when the streams arrive, density AMR rebuilds only one level per check.
+  **Collision box (implemented 2026-11-11, user decision to re-add refinement there):**
+  `si_box` = SI point (xc, yc) at t and at t + inj_lead, padded by `<problem>/si_pad`
+  (16 = one dx = 0.5 block) in x, y and z, enforced at amr_level under the same
+  condition as the injection boxes (inj_box_on). Supersedes the reasoning under
+  "Injection boxes" that the SI point needs no forcing. Cost: ~3x3x2 blocks plus 2:1
+  buffers. fofc = true left on. Did not fix it either.
+  **Log + front speed (2026-11-11):** bad cells are NaNs; the front moves ~1 MeshBlock
+  per output frame. Under LAT outputs (and the event log) are written only at window
+  ends, so a frame is one window (~100 r_g/c): ~0.16c, not necessarily non-physical
+  (first read as "per step"; corrected). injection.log (lines every 256 cycles = one LAT window):
+  cycle 768 dfloor 4.8e7, vceil 4.5e7, fofc 7.6e7; 1024 vceil 3.4e8, fofc 2.9e8;
+  1280 all ~0 (NaN cells fail every floor comparison, so the counters go silent).
+  Reading: massive dfloor/vceil hits that FOFC's first-order LLF (positivity preserving
+  within CFL) cannot prevent, then NaNs spreading block by block, point to a CFL
+  violation. Under LAT the time step is set only at window ends (wiki: "outputs,
+  restarts, AMR and the time step run at window ends") and each block's factor is
+  frozen for the window, so gas that gets fast mid-window (CIO front leaving the pinned
+  blocks; caps allow |v| + c_s up to 1c) overruns its block's step. Hypothesis, to be
+  confirmed with lat = false.
+  **Confirmed (2026-11-11):** with lat = false the collision produces no NaNs, so LAT is
+  the cause.
+  **Fix (implemented 2026-11-11, user decision):** LAT back on with
+  `<time>/lat_pin_density_contrast = 1e3` (built in: a block whose own max/min density
+  >= 1e3, plus its neighbours, gets f = 1; follows the CIO/background front wherever it
+  goes) and `lat_levels = 6` (window = max factor = 64 fine ticks, was 256, so the front
+  moves a fraction of a block per window and stays inside the pinned ring). Rejected for
+  now: lowering lat_pin_density to ~1e-20 (pins the whole CIO volume; fallback if the
+  contrast pin is not enough, or lower the contrast to 1e2), a collision-box LAT cap
+  (fixes only the onset). Side effects: coarse blocks step 4x more often; AMR checks
+  (ncycle_check = 128) now land every 2nd window; streams update 4x more often.
+  **Worked (2026-11-11):** test run with LAT on gets through the collision without NaNs.
+  Still to check: cost per r_g/c vs the old lat_levels = 8 setup, and whether the
+  contrast pin grows expensive as the CIO spreads.
+  Lesson (general rule, extends the 2026-11-07 one): LAT freezes the fine tick and each
+  block's factor for a whole window, so any gas that becomes fast mid-window outside the
+  pinned blocks blows up; pins must follow such fronts, and windows must be short enough
+  that a front cannot cross the pinned neighbour ring in one window.
+- **tinj = 2000 (2026-11-11, user decision; user regenerates data/inj.ascii):** injection
+  moves further upstream of the SI point. Code change: the collision box now has its own
+  switch, `si_box_on` = table on at t - tinj, t or t + inj_lead (endpoint test is enough
+  since phases >> tinj + inj_lead). Before, it shared inj_box_on and dropped at each off
+  switch although gas injected just before the switch collides for another tinj (a latent
+  gap at tinj = 1000 too); since the entropy cut no longer refines shocked gas, the box is
+  what keeps the collision at amr_level. New deck key `<problem>/tinj` (required, must
+  match the table). Deck `<refined_region8>` (initial_only) must be updated by hand to
+  cover the new t0 cylinders: at t0 the table is on, so the look-ahead cannot pre-refine
+  them, and V_cyl assumes they sit on amr_level.
+  Done (2026-11-11): new table has t0 cylinders at (-922.8, -189.1) in / (-810.3, -164.2)
+  out, SI at (-861.5, -191.3) (~60 r_g upstream, was ~30). region8 = x [-944, -800],
+  y [-208, -144], z [-16, 16]: the union of the pgen's t0 injection boxes (incl. look-ahead)
+  and collision box, rounded out to 16 r_g block edges (72 blocks, was 36).
+- **CIO fallback cost (2026-11-11):** at t ≈ 1.42e5 the run was at ~2650 blocks (88% of
+  2 x 1500) and ~0.84 s wall per r_g/c (about 2x the average since t0; ~18 days to
+  tlim = 2e6). The falling-back CIO exceeded amr_rho_min, so it was refined to dx = 0.5, and
+  since lat_pin_density = amr_rho_min it was also pinned to f = 1. LAT bins per rank were
+  f1/f2/f4/f8 = 1071/175/58/23, so f1 did 91% of the work and LAT saved only ~11%.
+  **Stream-only AMR (implemented 2026-11-11, user decision):** the density criterion now
+  also requires low entropy: a cell counts if rho > amr_rho_min and
+  P/rho^gamma < `<problem>/amr_entropy_fac` (deck: 100) x K_s, where K_s is the larger of
+  the two streams' injected entropies (gm1 a_rad T^4 / rho_s^gamma, from the current
+  window's mdot). Entropy was chosen over temperature (user choice): rough estimate is
+  that the collision shock (~0.06c relative) puts the CIO at ~1e4 K_s, and that survives
+  adiabatic expansion/fallback, whereas the radiation T of CIO expanded to rho ~ 1e-16 to
+  1e-15 is only ~2x the stream's 1e5 K. The CIO now sits at whatever level the SMR nest /
+  SI box give it (dx ~ r/64 in the BH nest). Unverified: that streams stay below the cut
+  (numerical heating, efloor hits) and that the CIO is above it; check with a K/K_s slice.
+  Not yet changed: lat_pin_density = 1e-16 still pins the (now coarser) CIO blocks at f = 1;
+  raising it toward the stream density is the next lever (option 1 in that analysis).
+- **Mass history columns (implemented, 2026-11-09):** user history (enrolled by the pgen,
+  no deck key) appends `M_inj` and `M_exc` to the .hst.
+  M_inj = mdot_tot x duty-cycle on-time, computed analytically (exact because q uses the
+  discrete cylinder volume; restart-safe since it is a function of t). (2026-11-10: now a
+  per-window ledger, restarted from `<problem>/m_inj`; see time-dependent streams.)
+  M_exc = net mass removed by `ExcisionFixup` (sum of (rho - rho_exc) dV over reset cells).
+  A reset in RK stage s only survives into the step scaled by the later stages' gam0
+  (rk2 stage 1: 0.5), so counting every reset at weight 1 would overcount by ~50%.
+  **Core change:** `Hydro::HydroStateFixup` sets `pgen->user_hydro_state_fixup_weight`
+  (prod of gam0 over later stages; 1 on all other call paths: LAT refresh, reflux
+  correction, init), new member in `pgen.hpp`. Rank-local sum, MPI-reduced in
+  `user_hydro_lat_window_end_func` (so this assumes LAT is on), stored as `<problem>/m_exc`
+  via `user_metadata_func` for restarts. Pre/post-stage fixup calls see already-reset
+  cells and add ~0. Check: mass(t) - mass(0) - M_inj + M_exc should equal minus the
+  outer-boundary outflow (plus floor mass).
 - **Input deck:** `inputs/injection.athinput` (build with `-D PROBLEM=injection`).
   Current mesh/LAT values are placeholders.
 - **Atmosphere Bernoulli constant (implemented, 2026-11-08):** `<problem>/bern` (default 0):

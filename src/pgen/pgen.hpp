@@ -147,6 +147,10 @@ class ProblemGenerator {
   int user_srcs_stage=0;
   int user_srcs_nstages=0;
   bool user_srcs_stage_valid=false;
+  // Weight with which a change the state fixup makes now survives into the completed
+  // step: prod of gam0 over the later RK stages inside Hydro::HydroStateFixup (0.5 after
+  // rk2 stage 1), 1 on every other call path (step ends, LAT refresh/reflux, init).
+  Real user_hydro_state_fixup_weight=1.0;
 
   // predefined problem generator functions (default test suite)
   void CallProblemGenerator(ParameterInput *pin, bool is_restart);
