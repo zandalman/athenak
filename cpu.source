@@ -1,0 +1,2 @@
+module purge
+module load openmpi/gcc/4.1.0

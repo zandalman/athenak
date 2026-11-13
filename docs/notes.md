@@ -306,6 +306,61 @@ so we might need to modify the code to make the source terms work.
   (numerical heating, efloor hits) and that the CIO is above it; check with a K/K_s slice.
   Not yet changed: lat_pin_density = 1e-16 still pins the (now coarser) CIO blocks at f = 1;
   raising it toward the stream density is the next lever (option 1 in that analysis).
+- **3e6 Msun deck (2026-11-11):** `inputs/injection_3e6.athinput` with table
+  `data/inj_3e6.ascii` (header rp = 11.33, a_mb = 462.4, tinj = 1154.7 = 2000/sqrt3). The pgen
+  is mass-agnostic (G = M = c = 1; only temp -> a_rad T^4 uses `<units>`), so only the deck
+  changes. Table: t0 = 6.41e4; SI at r = 204 -> 255 by t = 1.15e6; injection points at
+  r ~ 291 (in) and ~86 (out); on/off phases only ~3300 r_g/c (~130 rows), vs ~3.6e4 at 1e6.
+  Changes (my choices, flagged to the user): units x3; r_in = 16 -> 8 (rp/r_in = 1.42 as at
+  1e6; 16 finest cells in radius, no dx = 0.25 level); thresholds 1e-16 -> 1e-17 (min stream
+  density 1.06e-16, outbound at t0); inj_lead 1500 -> 750 (sites on levels 3-5, and phases
+  must exceed tinj + inj_lead); tlim = 2e6/sqrt3 (same in fallback-time units); region8 split
+  into three initial_only boxes (regions 8-10: in cylinder, SI, out cylinder; 34 blocks vs
+  196 for one bounding box). Kept: mesh/nest, rho_atm/bern (P_bg/P_stream ~ 3e-5 to 2e-4),
+  H = 5, temp = 1e5 K, vceil (TR13 free fall at r = 8 ~ 0.38). Stream Mach is ~20 at t0,
+  ~70-90 later (vs ~300 at 1e6).
+  **Revised (2026-11-11, user decisions 1-4):** (1) dx = 0.25 inner cube (|x| <= 16), so
+  r_in = 8 is 32 cells; (2) temp lowered to keep the stream cold; (3) H = 1.67 (fixed
+  physical width, 5/3); (4) box 4096^3 (±2048, root dx0 = 32; nest shifts one level down,
+  level = 11 - log2(r), still 456 BH blocks, num_levels = 8).
+  Follow-ons (my choices): amr_level = 7 is now dx = 0.25 (streams ~6.7 cells per H; dx = 0.5
+  would give 3.3); blocks are 8 r_g, so si_pad = 8 and regions 8-10 recomputed on 8 r_g edges
+  (34 blocks). Smaller H raises rho_s 9x (min 9.5e-16, outbound at t0), so
+  amr_rho_min = lat_pin_density = 1e-16. temp = 4e4 K: criterion c_s tinj / H as at 1e6
+  (~0.3 for the outbound stream at t0; 1e5 K gave 1.7); Mach ~350 at t0. P_stream drops 39x
+  (1.05e-22), so rho_atm 1e-22 -> 1e-24 to keep P_bg/P_stream ~1e-5 to 6e-5. inj_lead = 750
+  kept (sites on levels 2-4, <= 5 checks ~115 r_g/c). Cost: fine tick ~0.18 (dx = 0.25 at
+  r_in), about half the dx = 0.5 value.
+  **tinj = 384.9 (2026-11-11, user regenerated the table):** same t0, SI point, mdot and
+  phases; injection points now r ~ 236 (in) / 170 (out), speeds 0.080 / 0.098. Deck: tinj,
+  regions 8 and 10 recomputed (SI region 9 unchanged); min stream density 1.4e-15 (outbound
+  at t0), thresholds kept at 1e-16. temp = 4e4 K kept: thermal spread over tinj is now only
+  ~0.07 H (criterion 0.3 H would allow ~8e4 K); Mach ~300 at t0. P_bg/P_stream ~1e-5 to 2e-5.
+- **3e5 Msun deck (2026-11-12):** `inputs/injection_3e5.athinput`, table `data/inj_3e5.ascii`
+  (rp = 52.57, a_mb = 996.2, tinj = 20000). Table: t0 = 2.990e5; SI moves out fast
+  (r = 1939 at t0, 2862 at 5.1e5, 5192 at 1.29e6, ~9000 at 3.7e6); phases ~2e5-5e5;
+  outbound stream near apocentre (|v| = 0.0069 at t0 vs 0.0144 inbound); mdot_out starts
+  50x below mdot_in and overtakes it by ~8e5. The injection sites drift at ~4e-3 c, ~0.6x the
+  outbound gas speed (mostly sideways), so the outbound stream will be smeared below
+  rho_s = mdot/(pi H^2 v) (~10% at 1e6).
+  **tinj:** the table generator's M^-3/2 scaling gave 12172, which put the outbound injection
+  only ~4 H from the SI point. I recommended ~3e4; user chose 2e4 (in 330 r_g = 19.8 H,
+  out 111 r_g = 6.7 H at t0; the outbound distance grows as v_out rises).
+  User decisions: box ±16384 (tlim = 2e6 sqrt(10/3) = 3.65e6, r_si/half-width 0.55 at tlim
+  as at 1e6), r_in = 32 (rp/r_in = 1.64), amr_level dx = 2 (H = 16.67, 8.3 cells),
+  temp = 8e4 K (spread 0.22 H over tinj, outbound Mach ~37 at t0), bern = 0.003.
+  Follow-ons (my choices): root dx0 = 256, BH nest ±2^(14-l), l = 1..8 (dx = 1 inside ±64,
+  r_in = 32 cells), 512 BH blocks, num_levels = 9, amr_level = 7; rho_atm = 1e-23 so
+  P_bg/P_stream ~1e-5 (as the 3e6 deck); thresholds stay 1e-16 (min rho_s 6.4e-16,
+  outbound at t0); inj_lead = 1e4 (up to 7 AMR checks as the site moves from level 3 to
+  root); inj_pad = 8; si_pad = 64 (one block); initial_only regions 9 (inbound) and 10
+  (SI + outbound, merged) written out to the 128 r_g parent blocks build_tree refines
+  anyway (16 + 96 blocks); outputs hst 300, 2D 1000, 3D 1e5, rst 2e4.
+  **bern caveat:** 0.003 lowers the background c_s at the sites from 0.059 to 0.034, but that
+  is still above the stream speeds (0.007-0.014); even bern = 0 gives 0.012-0.013, so no
+  hydrostatic gamma = 4/3 atmosphere is slower than the near-apocentre outbound stream.
+  Probably harmless: the injection blocks are pinned to f = 1 anyway (fine tick set by the
+  BH), and coarse background blocks hit the max LAT factor regardless. Not yet run.
 - **Mass history columns (implemented, 2026-11-09):** user history (enrolled by the pgen,
   no deck key) appends `M_inj` and `M_exc` to the .hst.
   M_inj = mdot_tot x duty-cycle on-time, computed analytically (exact because q uses the

@@ -1,0 +1,4 @@
+module purge
+module load nvhpc/21.5
+module load openmpi/cuda-11.3/nvhpc-21.5/4.1.1
+module load cudatoolkit/11.4

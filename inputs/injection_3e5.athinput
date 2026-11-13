@@ -1,0 +1,297 @@
+# AthenaK input file for the TDE stream-injection problem, M_BH = 3e5 Msun
+# (table data/inj_3e5.ascii: rp = 52.57, a_mb = 996.2, tinj = 20000).
+# Requires a build configured with -D PROBLEM=injection.
+# Units: G = M_BH = c = 1 (lengths in r_g, times in r_g/c).
+#
+# Telescoping SMR around the BH: 32768^3 r_g box, 128^3 root grid (dx0 = 256 r_g), and
+# nested cubes |x|,|y|,|z| <= 2^(14-l) at level l = 1..8, i.e. level = 14 - log2(r) and
+# dx ~ |x|/64.  The finest cells (level 8, |x| <= 64) have dx = 1 r_g, so the excision
+# r_in = 32 is 32 finest cells in radius.  Each nested cube is 128^3 cells at its own
+# level; with 32^3 MeshBlocks every cube edge falls on a parent-block edge, so the regions
+# are not padded outward.  512 MeshBlocks around the BH.
+# The SI point moves out fast (r ~ 1939 at t0 -> ~9000 by tlim, 0.55 of the box
+# half-width, as 2285/4096 at 1e6), so the site starts on BH level 3 and ends near root.
+#
+# AMR: blocks anywhere with cold stream gas (density > amr_rho_min, low entropy) are
+# refined to amr_level = 7 (dx = 2, so H = 16.67 is ~8.3 cells).  Level 8 (dx = 1) exists
+# only around the BH.  The pgen also keeps a box around each injection cylinder (padded by
+# inj_pad) and around the SI point (si_pad) at amr_level while the table is on now or at
+# t + inj_lead; downstream the density criterion keeps the streams refined.
+# Refinement is adaptive, so the pgen keeps every <refined_regionN> as a minimum level
+# (refined regions only set the initial mesh under AMR), except initial_only ones.
+
+<comment>
+problem   = TDE stream injection near the self-intersection point (skeleton)
+reference = Tejeda & Rosswog 2013, MNRAS 433, 1930 (TR13 potential)
+
+<job>
+basename = injection
+
+<units>                       # M_BH = 3e5 Msun (0.3 x the 1e6 values), G = M = c = 1
+length_cgs = 4.4312802e+10    # r_g
+mass_cgs   = 5.9673e+38       # M_BH
+time_cgs   = 1.47811818       # r_g/c
+
+<mesh>
+nghost = 2
+nx1    = 128
+x1min  = -16384.0
+x1max  = 16384.0
+ix1_bc = outflow
+ox1_bc = outflow
+
+nx2    = 128
+x2min  = -16384.0
+x2max  = 16384.0
+ix2_bc = outflow
+ox2_bc = outflow
+
+nx3    = 128
+x3min  = -16384.0
+x3max  = 16384.0
+ix3_bc = outflow
+ox3_bc = outflow
+
+<meshblock>
+nx1 = 32
+nx2 = 32
+nx3 = 32
+
+<mesh_refinement>
+refinement          = adaptive
+num_levels          = 9       # root + 8 levels (finest dx = 1, BH only)
+ncycle_check        = 128     # fine ticks between AMR checks (one level per check)
+refinement_interval = 128
+max_nmb_per_rank    = 1500    # ~15% below the measured ~1800-block OOM limit of one
+                              # Stellar GPU (see docs/notes.md, 2026-11-09)
+
+<amr_criterion0>
+method = user                 # InjectionRefinement in injection.cpp
+
+<refined_region1>             # dx = 128
+level = 1
+x1min = -8192.0
+x1max = 8192.0
+x2min = -8192.0
+x2max = 8192.0
+x3min = -8192.0
+x3max = 8192.0
+
+<refined_region2>             # dx = 64
+level = 2
+x1min = -4096.0
+x1max = 4096.0
+x2min = -4096.0
+x2max = 4096.0
+x3min = -4096.0
+x3max = 4096.0
+
+<refined_region3>             # dx = 32
+level = 3
+x1min = -2048.0
+x1max = 2048.0
+x2min = -2048.0
+x2max = 2048.0
+x3min = -2048.0
+x3max = 2048.0
+
+<refined_region4>             # dx = 16
+level = 4
+x1min = -1024.0
+x1max = 1024.0
+x2min = -1024.0
+x2max = 1024.0
+x3min = -1024.0
+x3max = 1024.0
+
+<refined_region5>             # dx = 8
+level = 5
+x1min = -512.0
+x1max = 512.0
+x2min = -512.0
+x2max = 512.0
+x3min = -512.0
+x3max = 512.0
+
+<refined_region6>             # dx = 4
+level = 6
+x1min = -256.0
+x1max = 256.0
+x2min = -256.0
+x2max = 256.0
+x3min = -256.0
+x3max = 256.0
+
+<refined_region7>             # dx = 2
+level = 7
+x1min = -128.0
+x1max = 128.0
+x2min = -128.0
+x2max = 128.0
+x3min = -128.0
+x3max = 128.0
+
+<refined_region8>             # dx = 1
+level = 8
+x1min = -64.0
+x1max = 64.0
+x2min = -64.0
+x2max = 64.0
+x3min = -64.0
+x3max = 64.0
+
+# Initial injection site at start_time, dx = 2.  initial_only: these only build the
+# initial mesh (the table is on at t0, so the pgen's look-ahead cannot pre-refine it, and
+# V_cyl assumes the cylinders sit on amr_level); the pgen's boxes take over afterwards.
+# Each covers the pgen's t0 boxes (incl. the inj_lead = 1e4 look-ahead), written out to the
+# whole parent blocks (128 r_g) that build_tree.cpp refines anyway.  The SI and outbound
+# boxes overlap, so they share one region.  16 + 96 = 112 blocks.
+
+<refined_region9>             # inbound cylinder: x [-2303.6, -2204.4], y [-357.1, -299.1],
+level = 7                     # z [-18.6, 18.6]
+initial_only = true
+x1min = -2304.0
+x1max = -2176.0
+x2min = -384.0
+x2max = -256.0
+x3min = -128.0
+x3max = 128.0
+
+<refined_region10>            # SI box: x [-2017.6, -1840.1], y [-436.2, -304.4], z +-64;
+level = 7                     # outbound cylinder: x [-1957.0, -1857.6], y [-291.7, -232.7]
+initial_only = true
+x1min = -2048.0
+x1max = -1792.0
+x2min = -512.0
+x2max = -128.0
+x3min = -128.0
+x3max = 128.0
+
+<time>
+evolution  = dynamic
+integrator = rk2              # LAT supports rk1, rk2, imex2 only
+cfl_number = 0.4              # margin: a LAT neighbour may step up to 2x its own limit
+nlim       = -1
+start_time = 2.990460273796145e+05   # first time in the injection table
+tlim       = 3.6515e6         # = 2e6 sqrt(10/3): the 1e6 run's tlim in units of the
+                              # fallback time (t_mb ~ M^-1/2 in r_g/c).  Covers 3 on phases
+                              # (2.99e5-5.09e5, 8.29e5-1.29e6, 1.91e6-2.71e6)
+ndiag      = 1
+
+lat               = true
+lat_levels        = 6         # factors up to 2^6: window = max factor = 64 fine ticks,
+                              # so the CIO front moves only a fraction of a block per
+                              # window and the pinned neighbour ring holds it
+lat_same_level    = true      # blocks on one level may step at different rates
+                              # (lat_same_level_max_ratio defaults to 2)
+lat_min_bin_count = 8         # set explicitly so runs are reproducible across rank counts
+lat_pin_density   = 1.0e-16   # blocks with stream gas and their neighbours step at
+                              # factor 1: ~0.16 of the lowest stream density in the run
+                              # (6.4e-16, outbound at t0); above the excision density
+                              # (~1.6e-22)
+lat_pin_density_contrast = 1.0e3  # blocks whose own max/min density >= 1e3, and their
+                              # neighbours, step at factor 1: pins the CIO/background
+                              # front, whose thin edge is below lat_pin_density
+                              # (NaN blow-up at the collision, 2026-11-11)
+
+<hydro>
+eos         = ideal
+gamma       = 1.3333333333333333
+reconstruct = plm
+rsolver     = hllc
+dfloor      = 1.0e-28         # below the background everywhere (~1.3e-25 at box corners)
+pfloor      = 1.0e-34
+vceil       = 0.5             # |v| cap [c]; Newtonian, so v ~ c is unphysical anyway
+                              # (TR13 free fall at r_in = 32 is ~0.24)
+cs_ceil     = 0.5             # sound-speed cap [c]; atmosphere c_s(r_in) ~ 0.10
+dual_energy = true            # separate internal energy: the inbound stream is Mach ~375
+                              # at t0 (eta1 default 1e-3)
+fofc        = true            # first-order LLF fluxes on cells whose stage update would
+                              # need a floor (docs/notes.md, 2026-11-11)
+
+<problem>
+user_srcs = true              # TR13 gravity (enrolled by the pgen regardless)
+
+r_in    = 32.0                # excision radius [r_g], must be > 2 and < rp = 52.57
+                              # (rp/r_in = 1.64); 32 finest cells in radius
+bern    = 0.003               # atmosphere Bernoulli constant: h = bern - Phi_s(r), so
+                              # rho is ~flat for r >> 1/bern = 333.  Lowered from 0.01 to cut
+                              # the background c_s at the injection sites (0.059 -> 0.034;
+                              # still above the stream speeds 0.007-0.014, see notes)
+rho_atm = 1.0e-23             # atmosphere density at r_atm.  With bern = 0.003:
+                              # rho ~ 1.9e-25 / 2.1e-25, P ~ 1.0e-5 / 1.1e-5 P_stream,
+                              # c_s ~ 0.034 at the inbound / outbound injection points
+                              # (r ~ 2255 / 1902); rho ~ 1.3e-25 at the box corners;
+                              # rho ~ 1.6e-22, c_s ~ 0.10 at r_in
+r_atm   = 100.0               # atmosphere normalization radius [r_g]
+
+amr_level   = 7               # dx = 2 for stream gas anywhere (and the pgen boxes)
+amr_rho_min = 1.0e-16         # ~0.16 of the lowest stream density in the run (6.4e-16,
+                              # outbound at t0; inbound 1.5e-14)
+amr_entropy_fac = 3.0         # ...and only gas with P/rho^gamma < this x the (larger)
+                              # injected stream entropy, i.e. the cold streams, not the
+                              # shock-heated CIO
+inj_lead    = 1.0e4           # look-ahead [r_g/c]: injection boxes are enforced from
+                              # inj_lead before each on phase.  The sites start on BH-nest
+                              # levels 2-3 and drift out to level 0-1 by tlim, so this must
+                              # cover up to 7 AMR checks (128 fine ticks each, fine tick
+                              # ~1-4 at r_in, so <= ~3500); ~3x margin.  Phases are >= 2e5
+inj_pad     = 8.0             # injection-box padding [r_g] (4 cells; cylinders drift
+                              # ~0.4 r_g per window; the box also spans t .. t + inj_lead)
+si_pad      = 64.0            # collision box: SI point (xc, yc) at t .. t + inj_lead,
+                              # padded by si_pad in x, y and z, held at amr_level with the
+                              # injection boxes, so the collision is never at a level
+                              # boundary (64 = one dx = 2 block, ~3.8 H); also held for
+                              # tinj after each off switch, while injected gas still arrives
+tinj        = 20000.0         # stream travel time injection -> SI [r_g/c]; must match the
+                              # tinj used to build inj_file (see its header).  At t0 the
+                              # injection points are 330 r_g (19.8 H, inbound) and 111 r_g
+                              # (6.7 H, outbound) from the SI point.  The pgen's endpoint
+                              # test needs phases (>= 2e5) > tinj + inj_lead (3e4)
+
+# Streams: inbound and outbound, from the injection table (columns t, state, xc, yc,
+# x_in, y_in, vx_in, vy_in, x_out, ..., mdot_in, mdot_out; code units; row t = injection
+# time).  Interpolated linearly in t once per LAT window; state (on/off) from the row at
+# or before t.  Each injected over a cylinder of radius H and length H centred on the
+# table position (z = 0), axis along the table velocity; rho_s = mdot/(pi H^2 v).
+inj_file = data/inj_3e5.ascii # relative to the run directory
+H        = 16.67              # stream radius [r_g], both streams: the 1e6 deck's 5 r_g at
+                              # fixed physical width (5 x 10/3); ~8.3 cells at dx = 2
+temp     = 8.0e4              # K, radiation temperature: e = a_rad T^4, both streams.
+                              # P_stream = 1.68e-23 code.  Outbound at t0 (slowest, least
+                              # dense): c_s = 1.9e-4, Mach ~37, thermal spread over tinj
+                              # c_s tinj ~ 0.22 H (criterion <~ 0.3 H); inbound Mach ~375
+
+<output1>
+file_type = hst               # hydro totals + user columns M_inj (cumulative injected
+dt        = 300.0             # mass), M_exc (cumulative mass removed by the excision),
+                              # mdot_in, mdot_out, inj_on (current window's streams)
+
+<output2>
+file_type = bin
+variable  = hydro_w
+id        = hydro2dz
+dt        = 1000.0
+slice_x3  = 0.0
+
+<output3>
+file_type = bin
+variable  = hydro_w
+id        = hydro2dy
+dt        = 1000.0
+slice_x2  = 0.0
+
+<output4>
+file_type = bin
+variable  = hydro_w
+id        = hydro3d
+dt        = 1.0e5
+
+<output5>
+file_type = rst
+id        = restart
+dt        = 2.0e4
+
+<output6>
+file_type = log                 # floor/ceiling/c2p-failure counts (injection.log), written
+dcycle    = 100                 # only on cycles where a counter is non-zero
